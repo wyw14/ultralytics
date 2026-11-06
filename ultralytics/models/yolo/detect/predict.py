@@ -1,7 +1,7 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 from ultralytics.engine.predictor import BasePredictor
-from ultralytics.engine.results import Results
+from ultralytics.engine.results import Candidates, Results
 from ultralytics.utils import nms, ops
 
 
@@ -52,6 +52,7 @@ class DetectionPredictor(BasePredictor):
             >>> processed_results = predictor.postprocess(preds, img, orig_imgs)
         """
         save_feats = getattr(self, "_feats", None) is not None
+        raw_preds = preds
         preds = nms.non_max_suppression(
             preds,
             self.args.conf,
@@ -77,6 +78,37 @@ class DetectionPredictor(BasePredictor):
         if save_feats:
             for r, f in zip(results, obj_feats):
                 r.feats = f  # add object features to results
+
+        if getattr(self.args, "save_candidates", False):
+            # Untruncated pre-NMS pool: no confidence floor, no class filter, and NMS at IoU 1.0 only orders rows,
+            # so Results.replay() can re-apply any conf/classes/iou/agnostic/max_det without another model forward.
+            cands = nms.non_max_suppression(
+                raw_preds,
+                0.0,
+                1.0,
+                None,
+                False,
+                max_det=10**9,
+                max_nms=10**9,
+                nc=0 if self.args.task == "detect" else len(self.model.names),
+                end2end=getattr(self.model, "end2end", False),
+                rotated=self.args.task == "obb",
+            )
+            protos = kwargs.get("protos")  # segment passes per-batch protos through to construct_results
+            for i, (result, cand) in enumerate(zip(results, cands)):
+                result.candidates = Candidates(
+                    cand,
+                    img.shape[2:],
+                    proto=None if protos is None else protos[i],
+                    retina_masks=self.args.retina_masks,
+                    rotated=self.args.task == "obb",
+                    kpt_shape=getattr(self.model, "kpt_shape", None),
+                    conf=self.args.conf if self.args.conf is not None else 0.25,
+                    iou=self.args.iou,
+                    classes=self.args.classes,
+                    agnostic=self.args.agnostic_nms,
+                    max_det=self.args.max_det,
+                )
 
         return results
 

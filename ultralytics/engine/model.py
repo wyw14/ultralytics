@@ -512,7 +512,9 @@ class Model(torch.nn.Module):
             predictor (type[BasePredictor], optional): A custom predictor class for making predictions. If None, the
                 method uses the default predictor for the task.
             **kwargs (Any): Additional keyword arguments for configuring the prediction process. These include `embed`
-                for returning feature embeddings from specified layers.
+                for returning feature embeddings from specified layers, and `save_candidates` for retaining
+                untruncated pre-NMS candidates on each result to enable `Results.replay()` without re-running the
+                model.
 
         Returns:
             (Iterator[ultralytics.engine.results.Results | torch.Tensor] | list[ultralytics.engine.results.Results] |

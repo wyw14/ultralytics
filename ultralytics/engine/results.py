@@ -15,8 +15,11 @@ from typing import Any
 import numpy as np
 import torch
 
-from ultralytics.utils import LOGGER, DataExportMixin, SimpleClass, ops
+from ultralytics.utils import LOGGER, DataExportMixin, SimpleClass, nms, ops
 from ultralytics.utils.plotting import Annotator, colors, save_one_box
+
+# Sentinel for Results.replay() arguments that should keep the values used by the original prediction
+_REPLAY_KEEP = object()
 
 
 class BaseTensor(SimpleClass):
@@ -194,6 +197,108 @@ class DepthMap(_DenseResultTensor):
     """Per-pixel depth map (meters) for one image, shape (H, W)."""
 
 
+class Candidates(SimpleClass):
+    """Untruncated pre-NMS detection candidates retained from one prediction for threshold/NMS replay.
+
+    Rows live in the preprocessed (letterboxed) image coordinate system and use the same layout as the rows built
+    inside `non_max_suppression`: `(x1, y1, x2, y2, confidence, class, *extra)` for axis-aligned tasks, where the
+    extra channels are mask coefficients (segment) or flattened keypoints (pose), and `(x, y, w, h, confidence,
+    class, angle)` for oriented boxes. Confidence/class filtering and NMS are re-applied to these rows by
+    `Results.replay()`, so no model forward pass is needed and the displayed results stay untouched.
+
+    Attributes:
+        data (torch.Tensor | np.ndarray): Candidate rows before class filtering, confidence truncation, and NMS.
+        img_shape (tuple[int, int]): Preprocessed image shape (height, width) the rows are expressed in.
+        proto (torch.Tensor | np.ndarray | None): Per-image mask prototype with shape (C, H, W) for segment replay.
+        retina_masks (bool): Whether segment masks should be regenerated at the original image resolution.
+        rotated (bool): Whether the rows carry oriented boxes with a trailing angle channel.
+        kpt_shape (tuple[int, int] | None): Keypoint shape (K, dimensions) for pose replay.
+        conf (float): Confidence threshold used by the prediction that produced the displayed result.
+        iou (float): IoU threshold used by the prediction that produced the displayed result.
+        classes (list[int] | None): Class filter used by the prediction that produced the displayed result.
+        agnostic (bool): Whether the prediction used class-agnostic NMS.
+        max_det (int): Detection cap used by the prediction that produced the displayed result.
+    """
+
+    def __init__(
+        self,
+        data: torch.Tensor | np.ndarray,
+        img_shape: tuple[int, int],
+        proto: torch.Tensor | np.ndarray | None = None,
+        retina_masks: bool = False,
+        rotated: bool = False,
+        kpt_shape: tuple[int, int] | None = None,
+        conf: float = 0.25,
+        iou: float = 0.7,
+        classes: list[int] | None = None,
+        agnostic: bool = False,
+        max_det: int = 300,
+    ) -> None:
+        """Initialize Candidates with untruncated pre-NMS rows and the settings to replay them."""
+        self.data = data
+        self.img_shape = tuple(img_shape)
+        self.proto = proto
+        self.retina_masks = retina_masks
+        self.rotated = rotated
+        self.kpt_shape = None if kpt_shape is None else tuple(kpt_shape)
+        self.conf = conf
+        self.iou = iou
+        self.classes = classes
+        self.agnostic = agnostic
+        self.max_det = max_det
+
+    def _copy_with(self, data, proto) -> Candidates:
+        """Return a Candidates copy with transferred tensors, preserving all replay metadata."""
+        return Candidates(
+            data,
+            self.img_shape,
+            proto=proto,
+            retina_masks=self.retina_masks,
+            rotated=self.rotated,
+            kpt_shape=self.kpt_shape,
+            conf=self.conf,
+            iou=self.iou,
+            classes=self.classes,
+            agnostic=self.agnostic,
+            max_det=self.max_det,
+        )
+
+    def _xfer(self, fn: str, *args, **kwargs) -> Candidates:
+        """Move data and proto tensors to a device or NumPy layout, mirroring BaseTensor transfer semantics."""
+        if fn == "numpy":
+            data = self.data.cpu().numpy() if isinstance(self.data, torch.Tensor) else np.copy(self.data)
+            proto = self.proto.cpu().numpy() if isinstance(self.proto, torch.Tensor) else self.proto
+        elif fn == "cpu":
+            data = self.data.cpu() if isinstance(self.data, torch.Tensor) else self.data
+            proto = self.proto.cpu() if isinstance(self.proto, torch.Tensor) else self.proto
+        else:
+            data = torch.as_tensor(self.data).cuda() if fn == "cuda" else torch.as_tensor(self.data).to(*args, **kwargs)
+            proto = (
+                None
+                if self.proto is None
+                else torch.as_tensor(self.proto).cuda()
+                if fn == "cuda"
+                else torch.as_tensor(self.proto).to(*args, **kwargs)
+            )
+        return self._copy_with(data, proto)
+
+    def cpu(self) -> Candidates:
+        """Return a copy with candidate and proto tensors on CPU."""
+        return self._xfer("cpu")
+
+    def numpy(self) -> Candidates:
+        """Return a copy with candidate and proto tensors as NumPy arrays."""
+        return self._xfer("numpy")
+
+    def cuda(self) -> Candidates:
+        """Return a copy with candidate and proto tensors on GPU."""
+        return self._xfer("cuda")
+
+    def to(self, *args, **kwargs) -> Candidates:
+        """Return a copy with candidate and proto tensors moved to the specified device/dtype."""
+        return self._xfer("to", *args, **kwargs)
+
+
 class Results(SimpleClass, DataExportMixin):
     """A class for storing and manipulating inference results.
 
@@ -224,6 +329,7 @@ class Results(SimpleClass, DataExportMixin):
         cuda: Move all tensors in the Results object to GPU memory.
         to: Move all tensors to the specified device and dtype.
         new: Create a new Results object with the same image, path, names, and speed attributes.
+        replay: Regenerate the view from retained candidates using new confidence, class, and NMS settings.
         plot: Plot detection results on an input BGR image.
         show: Display the image with annotated inference results.
         save: Save annotated inference results image to file.
@@ -257,6 +363,7 @@ class Results(SimpleClass, DataExportMixin):
         speed: dict[str, float] | None = None,
         semantic_mask: torch.Tensor | None = None,
         depth: torch.Tensor | None = None,
+        candidates: Candidates | None = None,
     ) -> None:
         """Initialize the Results class for storing and manipulating inference results.
 
@@ -273,6 +380,8 @@ class Results(SimpleClass, DataExportMixin):
             speed (dict | None): A dictionary containing preprocess, inference, and postprocess speeds (ms/image).
             semantic_mask (torch.Tensor | None): A 2D tensor of class IDs for semantic segmentation results.
             depth (torch.Tensor | None): A 2D float tensor of per-pixel depth values (H, W).
+            candidates (Candidates | None): Untruncated pre-NMS candidates retained for confidence/class/NMS replay
+                via `replay()`; populated when prediction runs with `save_candidates=True`.
 
         Notes:
             For the default pose model, keypoint indices for human body pose estimation are:
@@ -294,6 +403,7 @@ class Results(SimpleClass, DataExportMixin):
         self.names = names
         self.path = path
         self.save_dir = None
+        self.candidates = candidates
         self._keys = "boxes", "masks", "probs", "keypoints", "obb", "semantic_mask", "depth"
 
     def __getitem__(self, idx):
@@ -401,6 +511,9 @@ class Results(SimpleClass, DataExportMixin):
             if v is None:
                 continue
             setattr(r, k, getattr(v, fn)(*args, **kwargs))
+        if self.candidates is not None:
+            # Row indexing shares the per-image candidate pool; device/dtype transfers move its tensors
+            r.candidates = self.candidates if fn == "__getitem__" else getattr(self.candidates, fn)(*args, **kwargs)
         return r
 
     def cpu(self):
@@ -483,6 +596,109 @@ class Results(SimpleClass, DataExportMixin):
         result = Results(orig_img=self.orig_img, path=self.path, names=self.names, speed=self.speed)
         result.save_dir = self.save_dir
         return result
+
+    def replay(
+        self,
+        conf=_REPLAY_KEEP,
+        iou=_REPLAY_KEEP,
+        classes=_REPLAY_KEEP,
+        agnostic=_REPLAY_KEEP,
+        max_det=_REPLAY_KEEP,
+    ) -> Results:
+        """Regenerate this result's view from retained candidates using new confidence, class, and NMS settings.
+
+        Filtering and NMS are re-applied to the untruncated pre-NMS candidate pool saved with the result, so the
+        model is not run again and neither this result nor its candidates are modified. Box, mask, and keypoint
+        rows are rebuilt from the same kept indices, keeping them aligned. Candidates must have been retained by
+        predicting with `save_candidates=True`.
+
+        Args:
+            conf (float): Confidence threshold for the replayed view; defaults to the prediction's threshold.
+            iou (float): IoU threshold for the replayed NMS; defaults to the prediction's threshold.
+            classes (int | list[int] | None): Class id(s) to keep, or None for all classes; defaults to the
+                prediction's filter.
+            agnostic (bool): Whether to run class-agnostic NMS; defaults to the prediction's setting.
+            max_det (int): Maximum detections kept by the replayed NMS; defaults to the prediction's cap.
+
+        Returns:
+            (Results): A new Results object with boxes (and masks, keypoints, or OBB rows) regenerated from the
+            retained candidates.
+
+        Raises:
+            RuntimeError: If no candidates were retained (`save_candidates=True` was not set at prediction).
+            ValueError: If `conf` or `iou` is outside the [0.0, 1.0] range.
+
+        Examples:
+            >>> results = model("image.jpg", save_candidates=True)
+            >>> lenient = results[0].replay(conf=0.05)  # show more boxes without re-running the model
+            >>> persons = results[0].replay(classes=[0], iou=0.5)
+        """
+        cand = self.candidates
+        if cand is None:
+            raise RuntimeError(
+                "No candidates are retained on this result; predict with save_candidates=True to enable replay(), "
+                "e.g. model('image.jpg', save_candidates=True)."
+            )
+        conf = cand.conf if conf is _REPLAY_KEEP else conf
+        iou = cand.iou if iou is _REPLAY_KEEP else iou
+        classes = cand.classes if classes is _REPLAY_KEEP else classes
+        agnostic = cand.agnostic if agnostic is _REPLAY_KEEP else agnostic
+        max_det = cand.max_det if max_det is _REPLAY_KEEP else max_det
+        if not 0 <= conf <= 1:
+            raise ValueError(f"Invalid confidence threshold {conf}, valid values are between 0.0 and 1.0")
+        if not 0 <= iou <= 1:
+            raise ValueError(f"Invalid IoU threshold {iou}, valid values are between 0.0 and 1.0")
+
+        x = torch.as_tensor(cand.data)
+        keep = x[:, 4] > conf
+        if classes is not None:
+            cls_ids = torch.tensor([classes] if isinstance(classes, int) else classes, device=x.device)
+            keep &= (x[:, 5:6] == cls_ids).any(1)
+        x = x[keep]
+        if x.shape[0]:
+            keep = nms.suppress(x, iou, agnostic=agnostic, rotated=cand.rotated)[:max_det]
+            x = x[keep]
+        x = x.clone()  # the geometric transforms below mutate coordinates; retained candidates stay read-only
+
+        img_shape = cand.img_shape
+        r = self.new()
+        if cand.proto is not None:
+            # Segment view: regenerate masks from kept mask coefficients, mirroring SegmentationPredictor
+            masks = None
+            if x.shape[0]:
+                if cand.retina_masks:
+                    x[:, :4] = ops.scale_boxes(img_shape, x[:, :4], self.orig_shape)
+                    masks = ops.process_mask_native(torch.as_tensor(cand.proto), x[:, 6:], x[:, :4], self.orig_shape)
+                else:
+                    masks = ops.process_mask(torch.as_tensor(cand.proto), x[:, 6:], x[:, :4], img_shape, upsample=True)
+                    x[:, :4] = ops.scale_boxes(img_shape, x[:, :4], self.orig_shape)
+                keep_masks = masks.amax((-2, -1)) > 0  # drop candidates whose mask is empty outside the image
+                x, masks = x[keep_masks], masks[keep_masks]
+            r.boxes = Boxes(x[:, :6], self.orig_shape)
+            if masks is not None and masks.shape[0]:
+                r.masks = Masks(masks, self.orig_shape)
+        elif cand.rotated:
+            # OBB view, mirroring OBBPredictor: xywh and angle stay separate while scaling
+            if x.shape[0]:
+                rboxes = torch.cat([x[:, :4], x[:, -1:]], dim=-1)
+                rboxes[:, :4] = ops.scale_boxes(img_shape, rboxes[:, :4], self.orig_shape, xywh=True)
+                x = torch.cat([rboxes, x[:, 4:6]], dim=-1)
+            r.obb = OBB(x, self.orig_shape)
+        elif cand.kpt_shape is not None:
+            # Pose view: keypoint rows follow the same kept indices as the boxes
+            kpts = torch.zeros((0, *cand.kpt_shape), device=x.device)
+            if x.shape[0]:
+                x[:, :4] = ops.scale_boxes(img_shape, x[:, :4], self.orig_shape)
+                kpts = x[:, 6:].view(x.shape[0], *cand.kpt_shape)
+                kpts = ops.scale_coords(img_shape, kpts, self.orig_shape)
+            r.boxes = Boxes(x[:, :6], self.orig_shape)
+            r.keypoints = Keypoints(kpts, self.orig_shape)
+        else:
+            # Detection view (including end-to-end models)
+            if x.shape[0]:
+                x[:, :4] = ops.scale_boxes(img_shape, x[:, :4], self.orig_shape)
+            r.boxes = Boxes(x[:, :6], self.orig_shape)
+        return r
 
     def plot(
         self,

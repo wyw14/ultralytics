@@ -1,5 +1,7 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
+from __future__ import annotations
+
 import sys
 import time
 
@@ -8,6 +10,48 @@ import torch
 from ultralytics.utils import LOGGER
 from ultralytics.utils.metrics import batch_probiou, box_iou
 from ultralytics.utils.ops import xywh2xyxy
+
+
+def suppress(
+    x,
+    iou_thres: float = 0.45,
+    agnostic: bool = False,
+    rotated: bool = False,
+    max_wh: int = 7680,
+    use_torchvision: bool | None = None,
+):
+    """Run NMS on expanded per-image candidate rows and return the kept indices.
+
+    The input layout matches the rows `non_max_suppression` builds after class selection: axis-aligned rows are
+    `(x1, y1, x2, y2, confidence, class, *extra)` while rotated rows are `(x, y, w, h, confidence, class, angle)`.
+    Only the geometry, confidence, and class columns are read, so mask coefficients, keypoints, and other extras
+    stay aligned with the returned indices.
+
+    Args:
+        x (torch.Tensor): Candidate rows with shape (N, 6+extra), confidence in column 4 and class in column 5.
+        iou_thres (float): IoU threshold for NMS filtering. Valid values are between 0.0 and 1.0.
+        agnostic (bool): Whether to perform class-agnostic NMS.
+        rotated (bool): Whether the rows carry rotated boxes (xywh plus a trailing angle channel).
+        max_wh (int): Per-class coordinate offset in pixels used to separate classes for class-aware NMS.
+        use_torchvision (bool | None): Whether to use torchvision NMS; None selects it when torchvision is already
+            imported on a non-XPU device, matching `non_max_suppression`.
+
+    Returns:
+        (torch.Tensor): Indices of the kept candidates, ordered by descending confidence.
+    """
+    if use_torchvision is None:
+        use_torchvision = x.device.type != "xpu" and "torchvision" in sys.modules
+    c = x[:, 5:6] * (0 if agnostic else max_wh)  # classes
+    scores = x[:, 4]  # scores
+    if rotated:
+        boxes = torch.cat((x[:, :2] + c, x[:, 2:4], x[:, -1:]), dim=-1)  # xywhr
+        return TorchNMS.fast_nms(boxes, scores, iou_thres, iou_func=batch_probiou)
+    boxes = x[:, :4] + c  # boxes (offset by class)
+    if use_torchvision:
+        import torchvision  # scope as slow import
+
+        return torchvision.ops.nms(boxes, scores, iou_thres)
+    return TorchNMS.nms(boxes, scores, iou_thres)
 
 
 def non_max_suppression(
@@ -143,20 +187,7 @@ def non_max_suppression(
             if return_idxs:
                 xk = xk[filt]
 
-        c = x[:, 5:6] * (0 if agnostic else max_wh)  # classes
-        scores = x[:, 4]  # scores
-        if rotated:
-            boxes = torch.cat((x[:, :2] + c, x[:, 2:4], x[:, -1:]), dim=-1)  # xywhr
-            i = TorchNMS.fast_nms(boxes, scores, iou_thres, iou_func=batch_probiou)
-        else:
-            boxes = x[:, :4] + c  # boxes (offset by class)
-            # Use torchvision if already imported; it has no XPU NMS kernel, but torch_npu CPU-falls back on NPU.
-            if use_torchvision:
-                import torchvision  # scope as slow import
-
-                i = torchvision.ops.nms(boxes, scores, iou_thres)
-            else:
-                i = TorchNMS.nms(boxes, scores, iou_thres)
+        i = suppress(x, iou_thres, agnostic, rotated, max_wh, use_torchvision)
         i = i[:max_det]  # limit detections
 
         output[xi] = x[i]

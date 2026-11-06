@@ -1237,6 +1237,181 @@ def test_results_update_probs():
     assert r.verbose() and r.summary(), "verbose()/summary() raise AttributeError on a raw Tensor probs"
 
 
+@pytest.mark.parametrize("task", ["detect", "segment", "pose", "obb"])
+def test_results_replay_multi_task(task):
+    """Results.replay() re-filters and re-applies NMS per task, keeping box/mask/keypoint/OBB indices aligned."""
+    from ultralytics.engine.results import Candidates, Results
+
+    orig_img = np.zeros((128, 128, 3), dtype=np.uint8)
+    img_shape = (160, 160)  # square letterbox with 0.8 gain to the 128x128 original
+    if task == "obb":
+        # xywh, conf, cls, angle; the two class-0 boxes have probiou ~0.83 (>0.7, <0.9)
+        rows = torch.tensor(
+            [
+                [30, 30, 40, 40, 0.9, 0, 0.0],
+                [34, 34, 40, 40, 0.8, 0, 0.0],
+                [100, 100, 40, 40, 0.3, 0, 0.1],
+                [30, 100, 40, 40, 0.7, 1, 0.2],
+            ],
+            dtype=torch.float32,
+        )
+        kwargs = {"rotated": True}
+    else:
+        # xyxy, conf, cls; the two class-0 boxes overlap with IoU ~0.82 (>0.7, <0.9)
+        rows = torch.tensor(
+            [
+                [10, 10, 50, 50, 0.9, 0],
+                [12, 12, 52, 52, 0.8, 0],
+                [80, 80, 120, 120, 0.3, 0],
+                [10, 80, 50, 120, 0.7, 1],
+            ],
+            dtype=torch.float32,
+        )
+        kwargs = {}
+
+    if task == "segment":
+        proto = torch.zeros(32, 40, 40)
+        proto[0] = 1.0  # coefficient 0 below produces a non-empty mask for every kept row
+        coeffs = torch.zeros(4, 32)
+        coeffs[:, 0] = 2.0
+        rows = torch.cat([rows, coeffs], 1)
+        kwargs["proto"] = proto
+    elif task == "pose":
+        kpts = torch.zeros(4, 2 * 3)
+        kpts[:, :2] = torch.tensor([30.0, 30.0])  # keypoints scale 30 -> 24 with the 0.8 letterbox gain
+        rows = torch.cat([rows, kpts], 1)
+        kwargs["kpt_shape"] = (2, 3)
+    snapshot = rows.clone()
+
+    r = Results(orig_img, path="image.jpg", names={0: "a", 1: "b"}, candidates=Candidates(rows, img_shape, **kwargs))
+    attr = "obb" if task == "obb" else "boxes"
+
+    assert len(r) == 0  # candidates alone do not populate the displayed view
+    view = r.replay()
+    assert len(getattr(view, attr)) == 3  # the 0.8 duplicate is suppressed at IoU 0.7
+    assert len(getattr(r.replay(conf=0.5), attr)) == 2  # the 0.3 box drops on confidence
+    assert len(getattr(r.replay(classes=[0]), attr)) == 2  # class 1 box filtered, duplicate suppressed
+    assert len(getattr(r.replay(iou=0.9), attr)) == 4  # looser IoU keeps the overlapping pair
+    top1 = r.replay(max_det=1)
+    assert len(getattr(top1, attr)) == 1 and float(getattr(top1, attr).conf[0]) == pytest.approx(0.9, abs=1e-6)
+
+    if task == "segment":
+        assert len(view.boxes) == len(view.masks) == view.masks.data.shape[0]
+        retina = Results(
+            orig_img,
+            path="image.jpg",
+            names={0: "a", 1: "b"},
+            candidates=Candidates(rows, img_shape, proto=proto, retina_masks=True),
+        ).replay(conf=0.5)
+        assert len(retina.boxes) == retina.masks.data.shape[0] == 2
+        assert retina.masks.data.shape[-2:] == orig_img.shape[:2]  # native-resolution masks
+    elif task == "pose":
+        assert len(view.boxes) == view.keypoints.data.shape[0]
+        assert view.keypoints.data.shape[1:] == (2, 3)
+        assert torch.allclose(view.keypoints.data[0, 0, :2], torch.tensor([24.0, 24.0]), atol=1.0)
+
+    # replays are independent views and never mutate the retained pool or each other's cached views
+    view_again = r.replay()
+    assert torch.equal(getattr(view, attr).data, getattr(view_again, attr).data)
+    assert torch.equal(r.candidates.data, snapshot)
+    view.plot()  # the replayed view renders end to end
+
+
+def test_results_replay_empty_candidates():
+    """Replay handles zero-row candidate pools and all-filtering thresholds without model reruns."""
+    from ultralytics.engine.results import Candidates, Results
+
+    orig_img = np.zeros((128, 128, 3), dtype=np.uint8)
+    img_shape = (160, 160)
+    proto = torch.zeros(32, 40, 40)
+    specs = {
+        "detect": ((0, 6), {}, "boxes"),
+        "segment": ((0, 38), {"proto": proto}, "boxes"),
+        "pose": ((0, 12), {"kpt_shape": (2, 3)}, "boxes"),
+        "obb": ((0, 7), {"rotated": True}, "obb"),
+    }
+    for task, (shape, kwargs, attr) in specs.items():
+        r = Results(
+            orig_img,
+            path="image.jpg",
+            names={0: "a"},
+            candidates=Candidates(torch.zeros(shape), img_shape, **kwargs),
+        )
+        view = r.replay()
+        assert len(view) == 0
+        assert getattr(view, attr).data.shape[0] == 0
+        if task == "segment":
+            assert view.masks is None  # no empty mask tensor is materialized
+        elif task == "pose":
+            assert view.keypoints.data.shape == (0, 2, 3)  # keypoint rows stay aligned at zero
+        view.plot()
+        assert "no detections" in view.verbose()
+
+    # a nonempty pool filtered out by the threshold yields the same empty, plottable view
+    rows = torch.tensor([[10, 10, 50, 50, 0.3, 0]], dtype=torch.float32)
+    empty = Results(orig_img, path="image.jpg", names={0: "a"}, candidates=Candidates(rows, img_shape, iou=0.7)).replay(
+        conf=1.0
+    )
+    assert len(empty) == 0 and empty.boxes.data.shape == (0, 6)
+    empty.plot()
+
+    # replay without retained candidates is an explicit error, not a silent model rerun
+    with pytest.raises(RuntimeError, match="save_candidates"):
+        Results(orig_img, path="image.jpg", names={0: "a"}).replay()
+    r = Results(orig_img, path="image.jpg", names={0: "a"}, candidates=Candidates(rows, img_shape))
+    with pytest.raises(ValueError):
+        r.replay(conf=2.0)
+    with pytest.raises(ValueError):
+        r.replay(iou=-0.1)
+
+
+@pytest.mark.parametrize("task", ["detect", "segment", "pose", "obb"])
+def test_predict_save_candidates_replay(task):
+    """save_candidates retains per-image candidates on real predictors, and replay reproduces the displayed view."""
+    from ultralytics.engine.results import Candidates
+
+    yaml_name = {
+        "detect": "yolo26.yaml",
+        "segment": "yolo26-seg.yaml",
+        "pose": "yolo26-pose.yaml",
+        "obb": "yolo26-obb.yaml",
+    }[task]
+    model = YOLO(ROOT / "cfg" / "models" / "26" / yaml_name, task=task)
+    im1 = np.zeros((128, 160, 3), dtype=np.uint8)
+    im2 = np.random.default_rng(0).integers(0, 255, (128, 160, 3), dtype=np.uint8)
+
+    assert model.predict(im1, imgsz=160, conf=0.0, verbose=False, device="cpu")[0].candidates is None
+
+    results = model.predict([im1, im2], imgsz=160, conf=0.0, save_candidates=True, batch=2, verbose=False, device="cpu")
+    attr = "obb" if task == "obb" else "boxes"
+    for r in results:
+        assert isinstance(r.candidates, Candidates)
+        shown = getattr(r, attr).data
+        assert r.candidates.data.shape[0] >= shown.shape[0]
+        view = r.replay()  # original settings: view must match the displayed result exactly, with no model rerun
+        assert torch.allclose(getattr(view, attr).data, shown, atol=1e-5)
+        if task == "segment":
+            assert len(view.boxes) == view.masks.data.shape[0]
+            assert torch.allclose(view.masks.data, r.masks.data, atol=1e-5)
+        elif task == "pose":
+            assert len(view.boxes) == view.keypoints.data.shape[0]
+            assert torch.allclose(view.keypoints.data, r.keypoints.data, atol=1e-5)
+        stricter = r.replay(conf=0.99)  # raises the floor above every random-weight score
+        assert len(getattr(stricter, attr)) == 0
+        if shown.shape[0]:
+            cls_id = int(shown[0, -1])
+            assert all(int(c) == cls_id for c in getattr(r.replay(classes=[cls_id]), attr).cls)
+
+    # streaming retains candidates too, and replay never mutates the displayed result or its pool
+    streamed = list(
+        model.predict(im1, imgsz=160, conf=0.0, save_candidates=True, stream=True, verbose=False, device="cpu")
+    )
+    assert streamed[0].candidates is not None
+    pool = streamed[0].candidates.data.clone()
+    streamed[0].replay(conf=0.5)
+    assert torch.equal(streamed[0].candidates.data, pool)
+
+
 def test_labels_and_crops(tmp_path):
     """Test output from prediction args for saving YOLO detection labels and crops."""
     imgs = [SOURCE, ASSETS / "zidane.jpg"]
