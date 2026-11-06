@@ -430,15 +430,18 @@ class YOLODataset(BaseDataset):
         label["instances"] = Instances(bboxes, segments, keypoints, bbox_format=bbox_format, normalized=normalized)
         return label
 
-    @staticmethod
-    def collate_fn(batch: list[dict]) -> dict:
+    def collate_fn(self, batch: list[dict]) -> dict:
         """Collate data samples into batches.
 
         Args:
             batch (list[dict]): List of dictionaries containing sample data.
 
         Returns:
-            (dict): Collated batch with stacked tensors.
+            (dict): Collated batch with stacked tensors. When the dataset was built with return_sources=True, an
+                additional 'source_map' key holds one record per image in batch order, so record i aligns with
+                batch['img'][i] and batch['im_file'][i]. Each record stores only the source image path ('im_file'),
+                the in-batch index ('index'), and whether augmentation was enabled ('augment'); it never stores image
+                content.
         """
         new_batch = {}
         batch = [dict(sorted(b.items())) for b in batch]  # make sure the keys are in the same order
@@ -458,6 +461,10 @@ class YOLODataset(BaseDataset):
             for i in range(len(new_batch["batch_idx"])):
                 new_batch["batch_idx"][i] += i  # add target image index for build_targets()
             new_batch["batch_idx"] = torch.cat(new_batch["batch_idx"], 0)
+        if self.return_sources:
+            new_batch["source_map"] = [
+                {"im_file": b["im_file"], "index": i, "augment": self.augment} for i, b in enumerate(batch)
+            ]
         return new_batch
 
 
@@ -860,7 +867,7 @@ class YOLOConcatDataset(ConcatDataset):
     function.
 
     Methods:
-        collate_fn: Static method that collates data samples into batches using YOLODataset's collation function.
+        collate_fn: Collate data samples into batches using the first sub-dataset's collation function.
 
     Examples:
         >>> dataset1 = YOLODataset(...)
@@ -868,9 +875,10 @@ class YOLOConcatDataset(ConcatDataset):
         >>> combined_dataset = YOLOConcatDataset([dataset1, dataset2])
     """
 
-    @staticmethod
-    def collate_fn(batch: list[dict]) -> dict:
+    def collate_fn(self, batch: list[dict]) -> dict:
         """Collate data samples into batches.
+
+        All sub-datasets are built from the same configuration, so the first sub-dataset's collation is reused.
 
         Args:
             batch (list[dict]): List of dictionaries containing sample data.
@@ -878,7 +886,7 @@ class YOLOConcatDataset(ConcatDataset):
         Returns:
             (dict): Collated batch with stacked tensors.
         """
-        return YOLODataset.collate_fn(batch)
+        return self.datasets[0].collate_fn(batch)
 
     def close_mosaic(self, hyp: IterableSimpleNamespace) -> None:
         """Disable mosaic, copy_paste, mixup and cutmix augmentations by setting their values to 0.0.

@@ -55,6 +55,7 @@ class BaseDataset(Dataset):
         transforms (callable): Image transformation function.
         batch_shapes (np.ndarray): Batch shapes for rectangular training.
         batch (np.ndarray): Batch index of each image.
+        return_sources (bool): Whether collated batches include the per-image 'source_map' source metadata.
 
     Methods:
         get_img_files: Read image files from the specified path.
@@ -122,6 +123,7 @@ class BaseDataset(Dataset):
         classes: list[int] | None = None,
         fraction: float = 1.0,
         channels: int = 3,
+        return_sources: bool = False,
     ):
         """Initialize BaseDataset with given configuration and options.
 
@@ -141,11 +143,14 @@ class BaseDataset(Dataset):
             fraction (float | int): Dataset ratio or image count to use.
             channels (int): Number of channels in the images (1 for grayscale, 3 for color). Color images loaded with
                 OpenCV are in BGR channel order.
+            return_sources (bool): If True, collated batches carry a 'source_map' with each image's source file path,
+                in-batch index, and augmentation flag. Defaults to False, which leaves collated batches unchanged.
         """
         super().__init__()
         self.img_path = img_path
         self.imgsz = imgsz
         self.augment = augment
+        self.return_sources = return_sources
         self.single_cls = single_cls
         self.prefix = prefix
         self.fraction = get_split_fraction(fraction, "train")

@@ -246,6 +246,7 @@ def build_yolo_dataset(
     stride: int = 32,
     multi_modal: bool = False,
     fraction: float | None = None,
+    return_sources: bool = False,
 ) -> Dataset:
     """Build and return a YOLO dataset based on configuration parameters.
 
@@ -259,6 +260,8 @@ def build_yolo_dataset(
         stride (int, optional): Model stride used for rectangular batch shapes.
         multi_modal (bool, optional): Whether to build a YOLOMultiModalDataset with text annotations.
         fraction (float | None, optional): Fraction of the dataset to use. If None, it is derived from cfg.fraction.
+        return_sources (bool, optional): If True, collated batches include a 'source_map' with each image's source
+            file path, in-batch index, and augmentation flag. Defaults to False.
 
     Returns:
         (Dataset): A DepthDataset, SemanticDataset, PolygonSemanticDataset, YOLOMultiModalDataset, or YOLODataset
@@ -299,6 +302,7 @@ def build_yolo_dataset(
         classes=cfg.classes,
         data=data,
         fraction=fraction,
+        return_sources=return_sources,
     )
 
 
