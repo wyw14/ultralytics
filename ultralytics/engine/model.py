@@ -13,7 +13,7 @@ import torch
 from PIL import Image
 
 from ultralytics.cfg import QUANTIZE_ALIASES, TASK2DATA, _handle_deprecation, get_cfg, get_save_dir
-from ultralytics.engine.results import Results
+from ultralytics.engine.results import IncrementalEncoder, Results
 from ultralytics.nn.backends.base import BaseBackend
 from ultralytics.nn.tasks import BaseModel, guess_model_task, load_checkpoint, yaml_model_load
 from ultralytics.utils import (
@@ -67,6 +67,7 @@ class Model(torch.nn.Module):
         embed: Generate image embeddings from intermediate model layers.
         predict: Perform predictions on given image sources.
         track: Perform object tracking.
+        incremental_stream: Stream per-frame Results as baseline/delta packets containing only changed detections.
         val: Validate the model on a dataset.
         calibrate: Fit scale-only depth calibration for depth models.
         benchmark: Benchmark the model on various export formats.
@@ -612,6 +613,46 @@ class Model(torch.nn.Module):
         kwargs["batch"] = kwargs.get("batch") or 1  # batch-size 1 for tracking in videos
         kwargs["mode"] = "track"
         return self.predict(source=source, stream=stream, **kwargs)
+
+    def incremental_stream(
+        self,
+        source=None,
+        *,
+        quant_tol: float | None = 1e-4,
+        keyframe: int = 0,
+        predictor=None,
+        **kwargs: Any,
+    ) -> Iterator[tuple[Results, dict]]:
+        """Yield each frame's Results together with an incremental baseline/delta packet for transport.
+
+        The first frame is always a self-contained baseline (all boxes, masks, keypoints, and the class mapping with
+        its version); subsequent frames are deltas carrying only instances and components that changed beyond the
+        quantization tolerance. Feed each packet to :class:`IncrementalDecoder` to rebuild the full Results remotely.
+        Tracking IDs (use ``tracker=...`` kwargs, e.g. via tracking) give stable per-instance identity across frames.
+
+        Args:
+            source: Image/video source, matching :meth:`predict`. Streamed one frame at a time.
+            quant_tol (float | None): Maximum absolute quantization error on normalized coordinates/confidences;
+                smaller values are more accurate, 0 or None is lossless.
+            keyframe (int): If > 0, force a fresh baseline every ``keyframe`` frames so a receiver that missed packets
+                can resync within the interval; 0 emits only the initial baseline (resend one on request instead).
+            predictor (type[BasePredictor], optional): Custom predictor class, forwarded to :meth:`predict`.
+            **kwargs (Any): Extra prediction arguments, forwarded to :meth:`predict`.
+
+        Yields:
+            (tuple[Results, dict]): ``(result, packet)`` per frame. Encoding only reads ``result``; the local Results
+            is never modified and stays usable regardless of packet transport problems.
+
+        Examples:
+            >>> for result, packet in model.incremental_stream("video.mp4", quant_tol=1e-3, keyframe=30):
+            ...     socket.send_json(packet)  # send; the decoder rebuilds Results from baseline plus deltas
+        """
+        encoder = None
+        for frame, result in enumerate(self.predict(source=source, stream=True, predictor=predictor, **kwargs)):
+            if encoder is None:  # lazily adopt model.names once the predictor has resolved the class mapping
+                encoder = IncrementalEncoder(self.names, quant_tol=quant_tol)
+            force = keyframe > 0 and frame > 0 and frame % keyframe == 0
+            yield result, encoder.encode(result, baseline=force)
 
     def val(
         self,

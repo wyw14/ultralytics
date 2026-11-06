@@ -7,6 +7,11 @@ Usage: See https://docs.ultralytics.com/modes/predict
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
+import math
 from copy import deepcopy
 from functools import cached_property
 from pathlib import Path
@@ -1621,4 +1626,510 @@ class OBB(BaseTensor):
             torch.stack([x.amin(1), y.amin(1), x.amax(1), y.amax(1)], -1)
             if isinstance(x, torch.Tensor)
             else np.stack([x.min(1), y.min(1), x.max(1), y.max(1)], -1)
+        )
+
+
+INCREMENTAL_PROTOCOL_VERSION = 1
+
+
+class IncrementalError(Exception):
+    """Base error for the incremental Results protocol.
+
+    The decoder never mutates its retained state when this error (or a subclass) is raised, so a corrupt, lost, or
+    reordered packet cannot affect previously reconstructed Results.
+    """
+
+
+class PacketIntegrityError(IncrementalError):
+    """Raised when a packet is malformed or its checksum does not match, indicating corruption or tampering."""
+
+
+class PacketOrderError(IncrementalError):
+    """Raised when a delta packet is missing its parent (packet loss), arrives out of order, or is duplicated."""
+
+
+class ClassMapMismatchError(IncrementalError):
+    """Raised when a packet's class-map version differs from the decoder's baseline mapping."""
+
+
+def _quant_decimals(quant_tol: float | None) -> int | None:
+    """Return the decimal places whose rounding error stays below the absolute quantization tolerance, or None for exact.
+
+    Rounding to ``d`` decimals has a maximum absolute error of ``0.5 * 10**-d``, so ``d`` is chosen as
+    ``ceil(-log10(2 * tol))``. Coordinates and confidences are normalized to [0, 1] before quantization, making the
+    tolerance resolution-independent.
+
+    Args:
+        quant_tol (float | None): Maximum acceptable absolute quantization error on a normalized value; 0 or None
+            disables quantization.
+
+    Returns:
+        (int | None): Number of decimal places to round to, or None for lossless float serialization.
+    """
+    if not quant_tol:
+        return None
+    if quant_tol <= 0:
+        raise ValueError(f"quant_tol must be a positive number or None, got {quant_tol!r}.")
+    return max(0, math.ceil(-math.log10(2.0 * float(quant_tol))))
+
+
+def _class_map_version(names: dict[int | str, str]) -> str:
+    """Return a stable short version hash of a class-id to class-name mapping.
+
+    Args:
+        names (dict): Class mapping as ``{class_id: class_name}``; keys may be ints or their string form.
+
+    Returns:
+        (str): A 12-character hex version carried by every packet so receiver and sender can detect mapping drift.
+    """
+    normalized = {int(k): str(v) for k, v in names.items()}
+    payload = json.dumps(normalized, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def _packet_checksum(packet: dict) -> str:
+    """Return a short SHA-256 checksum over the canonical JSON form of every packet field except ``crc``."""
+    body = {k: v for k, v in packet.items() if k != "crc"}
+    payload = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _encode_mask(mask: np.ndarray) -> str:
+    """Pack one binary mask (H, W) into a base64 string of its bit-packed uint8 buffer."""
+    binary = (np.asarray(mask) > 0.5).astype(np.uint8)
+    return base64.b64encode(np.packbits(binary).tobytes()).decode("ascii")
+
+
+def _decode_mask(blob: str, shape: tuple[int, int]) -> np.ndarray:
+    """Inverse of :func:`_encode_mask`, restoring a binary mask of shape (H, W) with values 0 and 1."""
+    try:
+        raw = np.frombuffer(base64.b64decode(blob.encode("ascii")), dtype=np.uint8)
+        h, w = shape
+        return np.unpackbits(raw, count=h * w).reshape(h, w)
+    except (ValueError, KeyError) as e:  # base64 / reshape failures are packet corruption
+        raise PacketIntegrityError("Corrupt mask payload in incremental packet.") from e
+
+
+def _to_numpy(data) -> np.ndarray:
+    """Copy a tensor or array to a detached host float64 numpy array without touching the source object."""
+    if isinstance(data, torch.Tensor):
+        data = data.detach().cpu().numpy()
+    return np.asarray(data, dtype=np.float64)
+
+
+def _round_list(values: np.ndarray, decimals: int | None) -> list:
+    """Quantize a numpy array to JSON-ready rounded Python values, or pass the exact floats through."""
+    return np.round(values, decimals).tolist() if decimals is not None else values.tolist()
+
+
+class IncrementalEncoder(SimpleClass):
+    """Encode a sequence of :class:`Results` as baseline and delta packets for incremental transport.
+
+    The first encoded frame (and any frame explicitly requested with ``baseline=True``) is a self-contained baseline
+    packet carrying every box, mask, and keypoint plus the full class mapping. Every later frame is encoded as a delta
+    against the previous packet: only added/removed instances and the components (``"b"`` box, ``"m"`` mask, ``"k"``
+    keypoints) whose quantized representation changed are sent. A receiver applying the packets in order rebuilds the
+    complete :class:`Results` for each frame.
+
+    Instance identity across frames is the tracking ID when ``result.boxes.is_track`` is True (e.g. from
+    :meth:`Model.track`); without tracking, the row index is used, which always reconstructs correctly but only saves
+    bandwidth while instance count and order stay stable. Every packet carries the class-map version, a monotonic
+    sequence number, its parent's sequence number, and a checksum, so loss, reordering, duplication, mapping drift,
+    and corruption are detectable on the receiver. Encoding only reads a :class:`Results`; it never mutates it.
+
+    Attributes:
+        names (dict[int, str]): Class mapping stamped into baseline packets.
+        cls_version (str): 12-character class-map version included in every packet.
+        quant_tol (float | None): Absolute normalized float quantization tolerance.
+        seq (int): Sequence number of the last emitted packet (0 before the first).
+
+    Examples:
+        >>> from ultralytics.engine.results import IncrementalEncoder
+        >>> encoder = IncrementalEncoder(model.names, quant_tol=1e-3)
+        >>> packets = [encoder.encode(result) for result in model.track("video.mp4", stream=True)]
+    """
+
+    def __init__(self, names: dict[int | str, str], quant_tol: float | None = 1e-4) -> None:
+        """Initialize the encoder with a class mapping and float quantization tolerance.
+
+        Args:
+            names (dict): ``{class_id: class_name}`` mapping of the producing model.
+            quant_tol (float | None): Maximum absolute quantization error on normalized coordinates/confidences;
+                smaller values are more accurate, 0 or None is lossless.
+        """
+        self.names = {int(k): str(v) for k, v in names.items()}
+        self.cls_version = _class_map_version(self.names)
+        self.quant_tol = quant_tol
+        self._decimals = _quant_decimals(quant_tol)
+        self.seq = 0
+        self._snap: dict | None = None
+
+    def reset(self) -> None:
+        """Restart the sequence; the next encoded frame becomes a fresh baseline."""
+        self.seq = 0
+        self._snap = None
+
+    def encode(self, result: Results, baseline: bool = False) -> dict:
+        """Encode one frame as a JSON-serializable baseline or delta packet without modifying the source Results.
+
+        Args:
+            result (Results): Detection/segmentation/pose result for the current frame; must carry ``.boxes``.
+            baseline (bool): Force a self-contained baseline packet (a periodic keyframe or a resync after a gap).
+
+        Returns:
+            (dict): The packet, with geometry normalized and quantized, masks packed losslessly, and a trailing
+                ``crc`` checksum.
+
+        Raises:
+            NotImplementedError: If the result uses OBB boxes, which this protocol does not encode.
+            ValueError: If the result has no boxes, or session-level structure (image shape, mask grid, tracking or
+                keypoint layout) changes mid-stream without requesting a baseline.
+        """
+        frame = self._snapshot(result)
+        snap = self._snap
+        is_key = baseline or snap is None
+        if not is_key:
+            if frame["shape"] != snap["shape"]:
+                raise ValueError("orig_shape changed between frames; encode(baseline=True) to start a new sequence.")
+            for field in ("track", "has_m", "has_k", "kvis", "mask_shape", "kpt_shape"):
+                if frame[field] != snap[field]:
+                    raise ValueError(
+                        f"{field!r} changed between frames; encode(baseline=True) to start a new sequence."
+                    )
+
+        self.seq += 1
+        packet: dict = {
+            "v": INCREMENTAL_PROTOCOL_VERSION,
+            "seq": self.seq,
+            "base": 0 if is_key else snap["seq"],
+            "key": is_key,
+            "shape": frame["shape"],
+            "cls": self.cls_version,
+            "track": frame["track"],
+            "has_m": frame["has_m"],
+            "has_k": frame["has_k"],
+            "kvis": frame["kvis"],
+            "order": frame["order"],
+            "add": {},
+            "upd": {},
+            "del": [],
+        }
+        if frame["mask_shape"] is not None:
+            packet["mask_shape"] = frame["mask_shape"]
+        if frame["kpt_shape"] is not None:
+            packet["kpt_shape"] = frame["kpt_shape"]
+        if is_key:
+            packet["names"] = {str(k): v for k, v in self.names.items()}
+            packet["add"] = {str(uid): dict(rec) for uid, rec in frame["records"].items()}
+        else:
+            old, new = snap["records"], frame["records"]
+            old_ids, new_ids = old.keys(), new.keys()
+            packet["del"] = sorted(old_ids - new_ids)
+            for uid in sorted(new_ids - old_ids):
+                packet["add"][str(uid)] = dict(new[uid])
+            for uid in sorted(new_ids & old_ids):
+                changed = {comp: new[uid][comp] for comp in ("b", "m", "k") if new[uid].get(comp) != old[uid].get(comp)}
+                if changed:
+                    packet["upd"][str(uid)] = changed
+        packet["crc"] = _packet_checksum(packet)
+        self._snap = {**frame, "seq": self.seq}
+        return packet
+
+    def _snapshot(self, result: Results) -> dict:
+        """Build a compact quantized per-instance snapshot of one frame by reading its tensors."""
+        boxes = result.boxes
+        if boxes is None:
+            if result.obb is not None:
+                raise NotImplementedError("The incremental protocol supports boxes, masks, and keypoints, not OBB.")
+            raise ValueError("The incremental protocol requires Results with boxes.")
+        h, w = result.orig_shape
+        data = _to_numpy(boxes.data)
+        n = len(data)
+        mdata = kdata = None
+        if result.masks is not None:
+            mdata = _to_numpy(result.masks.data)
+            if len(mdata) != n:
+                raise ValueError(f"Expected {n} masks aligned with boxes, got {len(mdata)}.")
+        if result.keypoints is not None:
+            kdata = _to_numpy(result.keypoints.data)
+            if len(kdata) != n:
+                raise ValueError(f"Expected {n} keypoint rows aligned with boxes, got {len(kdata)}.")
+
+        order, records = [], {}
+        scale = np.array([w, h, w, h], dtype=np.float64)
+        for i in range(n):
+            uid = int(data[i, -3]) if boxes.is_track else i
+            box_vals = np.empty(5, dtype=np.float64)
+            box_vals[:4] = data[i, :4] / scale
+            box_vals[4] = data[i, -2]
+            record = {"b": [*_round_list(box_vals, self._decimals), int(data[i, -1])]}
+            if mdata is not None:
+                record["m"] = _encode_mask(mdata[i])
+            if kdata is not None:
+                kpts = kdata[i].copy()
+                kpts[..., 0] /= w
+                kpts[..., 1] /= h
+                record["k"] = _round_list(kpts, self._decimals)
+            order.append(uid)
+            records[uid] = record
+
+        return {
+            "track": bool(boxes.is_track),
+            "shape": [h, w],
+            "has_m": mdata is not None,
+            "has_k": kdata is not None,
+            "kvis": bool(kdata.shape[-1] == 3) if kdata is not None else False,
+            "mask_shape": list(mdata.shape[1:]) if mdata is not None else None,
+            "kpt_shape": list(kdata.shape[1:]) if kdata is not None else None,
+            "order": order,
+            "records": records,
+        }
+
+
+class IncrementalDecoder(SimpleClass):
+    """Apply baseline/delta packets from :class:`IncrementalEncoder` and rebuild each frame's :class:`Results`.
+
+    A baseline packet resets decoder state and bootstraps the class mapping; delta packets must arrive in the exact
+    sequence they were emitted (their ``base`` must equal the last applied ``seq``). Any integrity, order, or
+    class-map failure raises an :class:`IncrementalError` subclass before state is touched, leaving both the decoder
+    state and previously returned results intact; the sender should then be asked for a fresh baseline to resync.
+
+    Attributes:
+        seq (int): Sequence number of the last applied packet (0 before the first baseline).
+        names (dict[int, str] | None): Class mapping adopted from the first baseline.
+        cls_version (str | None): Class-map version the decoder validates deltas against.
+
+    Examples:
+        >>> from ultralytics.engine.results import IncrementalDecoder
+        >>> decoder = IncrementalDecoder()
+        >>> for packet in packets:
+        ...     result = decoder.apply(packet, orig_img=frame)  # full reconstructed Results
+    """
+
+    def __init__(self) -> None:
+        """Initialize an empty decoder; :meth:`apply` rejects deltas until a baseline has been accepted."""
+        self.reset()
+
+    def reset(self) -> None:
+        """Drop all retained state, as if no packet had been applied."""
+        self.seq = 0
+        self.names: dict[int, str] | None = None
+        self.cls_version: str | None = None
+        self._state: dict[int, dict] | None = None
+        self._order: list[int] = []
+        self._flags: dict = {}
+
+    @property
+    def initialized(self) -> bool:
+        """Return True once a baseline packet has been accepted and deltas may be applied."""
+        return self._state is not None
+
+    def apply(self, packet: dict, orig_img: np.ndarray | None = None) -> Results:
+        """Validate one packet, apply it atomically, and return the fully reconstructed Results.
+
+        Args:
+            packet (dict): A packet produced by :meth:`IncrementalEncoder.encode`.
+            orig_img (np.ndarray | None): Frame image to attach to the rebuilt Results; when None, a black placeholder
+                of the carried shape is used so the result stays fully usable for data and export operations.
+
+        Returns:
+            (Results): The complete frame result, built from fresh tensors owned by the decoder output.
+
+        Raises:
+            PacketIntegrityError: The packet is malformed, corrupt (bad checksum), or inconsistent with its session.
+            PacketOrderError: A delta precedes the baseline, references an unknown parent (loss), is reordered, or is
+                duplicated.
+            ClassMapMismatchError: The packet's class-map version differs from the baseline mapping.
+        """
+        if not isinstance(packet, dict) or "crc" not in packet:
+            raise PacketIntegrityError("Incremental packet must be a dict carrying a 'crc' field.")
+        if not hmac.compare_digest(str(packet["crc"]), _packet_checksum(packet)):
+            raise PacketIntegrityError("Incremental packet checksum mismatch; packet is corrupt or tampered with.")
+        if packet.get("v") != INCREMENTAL_PROTOCOL_VERSION:
+            raise PacketIntegrityError(
+                f"Unsupported incremental protocol version {packet.get('v')!r}; expected {INCREMENTAL_PROTOCOL_VERSION}."
+            )
+
+        if packet.get("key"):
+            state, order, names, cls_version, flags = self._read_baseline(packet)
+        else:
+            state, order, names, cls_version, flags = self._read_delta(packet)
+        shape = tuple(flags["shape"])
+        if orig_img is not None and tuple(orig_img.shape[:2]) != shape:
+            raise PacketIntegrityError(f"orig_img shape {orig_img.shape[:2]} does not match packet shape {shape}.")
+        result = self._build_result(state, order, names, flags, shape, orig_img)  # may raise before commit
+
+        self._state, self._order, self._flags = state, order, flags
+        self.names, self.cls_version, self.seq = names, cls_version, int(packet["seq"])
+        return result
+
+    def _read_baseline(self, packet: dict):
+        """Validate a baseline packet and assemble its candidate state (nothing committed on failure)."""
+        raw_names = packet.get("names")
+        if not isinstance(raw_names, dict) or not raw_names:
+            raise PacketIntegrityError("Baseline packet must carry the full class mapping in 'names'.")
+        names = {int(k): str(v) for k, v in raw_names.items()}
+        cls_version = _class_map_version(names)
+        if packet.get("cls") != cls_version:
+            raise PacketIntegrityError("Baseline 'cls' version does not match its 'names' mapping.")
+        flags = self._read_flags(packet)
+        state: dict[int, dict] = {}
+        for key, rec in packet.get("add", {}).items():
+            self._add_instance(state, int(key), rec, flags)
+        if packet.get("upd") or packet.get("del"):
+            raise PacketIntegrityError("Baseline packet must not contain 'upd' or 'del' entries.")
+        order = [int(x) for x in packet.get("order", [])]
+        self._check_order(state, order)
+        return state, order, names, cls_version, flags
+
+    def _read_delta(self, packet: dict):
+        """Validate a delta packet against retained state and return its candidate state (nothing committed)."""
+        if self._state is None:
+            raise PacketOrderError("Cannot apply a delta packet before its baseline; resync with a baseline packet.")
+        if packet.get("cls") != self.cls_version:
+            raise ClassMapMismatchError(
+                f"Packet class-map version {packet.get('cls')!r} does not match baseline {self.cls_version!r}."
+            )
+        flags = self._read_flags(packet)
+        for field in ("track", "has_m", "has_k", "kvis", "mask_shape", "kpt_shape"):
+            if flags[field] != self._flags[field]:
+                raise PacketIntegrityError(f"Session field {field!r} changed; a new baseline is required.")
+        if packet.get("base") != self.seq:
+            raise PacketOrderError(
+                f"Packet builds on seq {packet.get('base')} but decoder last applied {self.seq}; "
+                "a packet was lost or reordered. Resync with a baseline packet."
+            )
+        if not isinstance(packet.get("seq"), int) or packet["seq"] <= self.seq:
+            raise PacketOrderError(f"Duplicate or reordered packet seq {packet.get('seq')!r}; expected > {self.seq}.")
+
+        state = deepcopy(self._state)
+        for uid in packet.get("del", []):
+            uid = int(uid)
+            if uid not in state:
+                raise PacketIntegrityError(f"Packet deletes unknown instance id {uid}.")
+            del state[uid]
+        for key, rec in packet.get("add", {}).items():
+            uid = int(key)
+            if uid in state:
+                raise PacketIntegrityError(f"Packet adds instance id {uid} that already exists.")
+            self._add_instance(state, uid, rec, flags)
+        for key, changes in packet.get("upd", {}).items():
+            uid = int(key)
+            if uid not in state:
+                raise PacketIntegrityError(f"Packet updates unknown instance id {uid}.")
+            for comp, value in changes.items():
+                if comp not in {"b", "m", "k"}:
+                    raise PacketIntegrityError(f"Unknown component {comp!r} in update for id {uid}.")
+                self._check_component(comp, value, flags)
+                state[uid][comp] = value
+        order = [int(x) for x in packet.get("order", [])]
+        self._check_order(state, order)
+        return state, order, self.names, self.cls_version, flags
+
+    @staticmethod
+    def _read_flags(packet: dict) -> dict:
+        """Extract and type-check session-level flags shared by baseline and delta packets."""
+        try:
+            shape = [int(x) for x in packet["shape"]]
+            track = bool(packet["track"])
+            has_m, has_k, kvis = bool(packet["has_m"]), bool(packet["has_k"]), bool(packet["kvis"])
+            mask_shape = [int(x) for x in packet["mask_shape"]] if packet.get("mask_shape") is not None else None
+            kpt_shape = [int(x) for x in packet["kpt_shape"]] if packet.get("kpt_shape") is not None else None
+        except (KeyError, TypeError, ValueError) as e:
+            raise PacketIntegrityError(f"Malformed incremental packet flags: {e}") from e
+        if len(shape) != 2 or (has_m and mask_shape is None) or (has_k and kpt_shape is None):
+            raise PacketIntegrityError("Incremental packet flags are missing the mask or keypoint grid shape.")
+        return {
+            "shape": shape,
+            "track": track,
+            "has_m": has_m,
+            "has_k": has_k,
+            "kvis": kvis,
+            "mask_shape": mask_shape,
+            "kpt_shape": kpt_shape,
+        }
+
+    @staticmethod
+    def _check_order(state: dict, order: list[int]) -> None:
+        """Reject packets whose order list is missing, duplicates, or invents instance ids."""
+        if len(order) != len(set(order)):
+            raise PacketIntegrityError("Duplicate instance id in packet 'order'.")
+        if set(order) != set(state):
+            raise PacketIntegrityError("Packet 'order' does not match its instance set.")
+
+    def _add_instance(self, state: dict, uid: int, rec: dict, flags: dict) -> None:
+        """Validate and insert one full instance record from an 'add' entry."""
+        if not isinstance(rec, dict) or "b" not in rec:
+            raise PacketIntegrityError(f"Malformed record for instance id {uid}.")
+        for comp in ("b", "m", "k"):
+            if comp in rec:
+                self._check_component(comp, rec[comp], flags)
+        if flags["has_m"] and "m" not in rec:
+            raise PacketIntegrityError(f"Instance id {uid} is missing its mask.")
+        if flags["has_k"] and "k" not in rec:
+            raise PacketIntegrityError(f"Instance id {uid} is missing its keypoints.")
+        state[uid] = dict(rec)
+
+    @staticmethod
+    def _check_component(comp: str, value, flags: dict) -> None:
+        """Validate the type and shape of one serialized component against session flags."""
+        if comp == "b":
+            if not isinstance(value, list) or len(value) != 6 or not all(isinstance(x, (int, float)) for x in value):
+                raise PacketIntegrityError("Box record must be 6 numeric values [x1, y1, x2, y2, conf, cls].")
+        elif comp == "m":
+            if not isinstance(value, str):
+                raise PacketIntegrityError("Mask record must be a base64 string.")
+            _decode_mask(value, flags["mask_shape"])  # fail early on corrupt payload
+        elif comp == "k":
+            k, c = flags["kpt_shape"]
+            ok = (
+                isinstance(value, list)
+                and len(value) == k
+                and all(
+                    isinstance(p, list) and len(p) == c and all(isinstance(x, (int, float)) for x in p) for p in value
+                )
+            )
+            if not ok:
+                raise PacketIntegrityError(f"Keypoint record must be a ({k}, {c}) nested list of numbers.")
+
+    @staticmethod
+    def _build_result(state, order, names, flags, shape, orig_img) -> Results:
+        """Assemble a fresh Results object from decoded instance state."""
+        h, w = shape
+        n = len(order)
+        track, cols = flags["track"], 7 if flags["track"] else 6
+        box_data = np.zeros((n, cols), dtype=np.float32)
+        mask_rows = [] if flags["has_m"] else None
+        kpt_rows = [None] * n if flags["has_k"] else None
+        for row, uid in enumerate(order):
+            b = state[uid]["b"]
+            xyxy = np.array(b[:4], dtype=np.float64) * np.array([w, h, w, h])
+            box_data[row] = [*xyxy, uid, b[4], b[5]] if track else [*xyxy, b[4], b[5]]
+            if flags["has_m"]:
+                mask_rows.append(_decode_mask(state[uid]["m"], flags["mask_shape"]))
+            if flags["has_k"]:
+                kpts = np.array(state[uid]["k"], dtype=np.float64)
+                kpts[..., 0] *= w
+                kpts[..., 1] *= h
+                kpt_rows[row] = kpts
+        masks = keypoints = None
+        if flags["has_m"]:
+            grid = np.empty((0, *flags["mask_shape"]), dtype=np.uint8) if n == 0 else np.stack(mask_rows)
+            masks = torch.from_numpy(grid).float()
+        if flags["has_k"]:
+            grid = (
+                np.empty((0, *flags["kpt_shape"]), dtype=np.float32)
+                if n == 0
+                else np.stack(kpt_rows).astype(np.float32)
+            )
+            keypoints = torch.from_numpy(grid)
+        if orig_img is None:
+            orig_img = np.zeros((h, w, 3), dtype=np.uint8)
+        return Results(
+            orig_img,
+            path="",
+            names=names,
+            boxes=torch.from_numpy(box_data),
+            masks=masks,
+            keypoints=keypoints,
         )
