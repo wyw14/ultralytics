@@ -514,6 +514,530 @@ def validate_args(format, passed_args, valid_args):
             assert arg in valid_args, f"ERROR ❌️ argument '{arg}' is not supported for format='{format}'"
 
 
+class ExportDiagnostic:
+    """A single stable export precheck finding.
+
+    Attributes:
+        level (str): 'warning' (export proceeds, caveat) or 'error' (export is expected to fail).
+        code (str): Stable machine-readable identifier, e.g. 'CLASS_COUNT_MISMATCH'.
+        message (str): Human-readable explanation of the finding.
+    """
+
+    __slots__ = ("code", "level", "message")
+
+    def __init__(self, level: str, code: str, message: str):
+        """Initialize an ExportDiagnostic with a severity level, stable code, and message."""
+        self.level = level
+        self.code = code
+        self.message = message
+
+    def to_dict(self) -> dict:
+        """Return the diagnostic as a JSON-serializable dictionary."""
+        return {"level": self.level, "code": self.code, "message": self.message}
+
+    def __str__(self) -> str:
+        """Return a one-line rendering prefixed with the severity and stable code."""
+        icon = "⚠️ " if self.level == "warning" else "❌ "
+        return f"{icon}{self.code}: {self.message}"
+
+
+class ExportPrecheckReport:
+    """Result of an export precheck: resolved export settings, probed output signature, and diagnostics.
+
+    Attributes:
+        format (str): Resolved export format argument, e.g. 'onnx' or 'engine'.
+        task (str): Model task, e.g. 'detect' or 'segment'.
+        device (str): Device the probe ran on, e.g. 'cpu' or 'cuda:0'.
+        input_shape (tuple | None): Probe input shape (B, C, H, W).
+        output_shape (tuple | None): Probe output shape(s), in the same nested-tuple form used by the Exporter log.
+        warnings (list[ExportDiagnostic]): Conditions that do not block export but change or limit it.
+        errors (list[ExportDiagnostic]): Conditions expected to make export fail or yield an unusable artifact.
+    """
+
+    def __init__(self, format: str = "", task: str = "", device: str = ""):
+        """Initialize an empty precheck report for the given format, task, and device."""
+        self.format = format
+        self.task = task
+        self.device = device
+        self.input_shape = None
+        self.output_shape = None
+        self.warnings: list[ExportDiagnostic] = []
+        self.errors: list[ExportDiagnostic] = []
+
+    @property
+    def passed(self) -> bool:
+        """Return True when the precheck found no errors (warnings do not fail the precheck)."""
+        return not self.errors
+
+    def warning(self, code: str, message: str) -> None:
+        """Record a non-blocking warning under a stable diagnostic code."""
+        self.warnings.append(ExportDiagnostic("warning", code, message))
+
+    def error(self, code: str, message: str) -> None:
+        """Record a blocking error under a stable diagnostic code."""
+        self.errors.append(ExportDiagnostic("error", code, message))
+
+    def to_dict(self) -> dict:
+        """Return the full report as a JSON-serializable dictionary."""
+        return {
+            "format": self.format,
+            "task": self.task,
+            "device": self.device,
+            "passed": self.passed,
+            "input_shape": self.input_shape,
+            "output_shape": self.output_shape,
+            "warnings": [d.to_dict() for d in self.warnings],
+            "errors": [d.to_dict() for d in self.errors],
+        }
+
+    def __str__(self) -> str:
+        """Render the report as a stable, human-readable summary."""
+        lines = [f"Export precheck: format='{self.format}' task='{self.task}' device='{self.device}'"]
+        if self.input_shape is not None:
+            lines.append(f"  input shape:  {self.input_shape}")
+        if self.output_shape is not None:
+            lines.append(f"  output shape: {self.output_shape}")
+        lines.extend(f"  WARNING {d}" for d in self.warnings)
+        lines.extend(f"  ERROR   {d}" for d in self.errors)
+        lines.append(f"  Result: {'PASS ✅' if self.passed else 'FAIL ❌'}")
+        return "\n".join(lines)
+
+
+def _package_version(name: str) -> str | None:
+    """Return an installed package's version string without importing it, or None if it is not installed."""
+    import importlib.metadata as importlib_metadata
+
+    try:
+        return importlib_metadata.version(name)
+    except importlib_metadata.PackageNotFoundError:
+        return None
+
+
+def _output_signature_expected(head, nc: int) -> tuple[str, int, int]:
+    """Return the (family, extra channels, mask protos) that Results decoding expects from a head.
+
+    Args:
+        head (torch.nn.Module): The model's output head (last layer).
+        nc (int): Number of class names advertised by the model.
+
+    Returns:
+        (tuple[str, int, int]): Output family ('segment', 'pose', 'obb', 'detect' or 'other'), extra channels
+            appended after the 4 box coordinates and class scores in raw BCN outputs, and the number of mask
+            prototypes for segmentation heads (0 otherwise).
+    """
+    nm = int(getattr(head, "nm", 0)) if isinstance(head, (Segment, Segment26)) else 0
+    if nm:
+        return "segment", nm, nm
+    if isinstance(head, Pose):
+        kpt_shape = getattr(head, "kpt_shape", (0, 0))
+        return "pose", int(np.prod(kpt_shape)), 0
+    return ("obb", 1, 0) if isinstance(head, OBB) else ("detect", 0, 0) if isinstance(head, Detect) else ("other", 0, 0)
+
+
+def precheck_export(
+    model: torch.nn.Module, overrides: dict | None = None, verbose: bool = True
+) -> ExportPrecheckReport:
+    """Precheck device, operator, and output-signature compatibility before exporting a model.
+
+    The precheck reproduces the Exporter's model preparation on an in-memory copy (deep copy, fuse, export head
+    flags, optional embedded NMS) and runs a zero-input dry pass, then verifies the output signature that the
+    Results postprocessing path consumes: batch/layout structure, the class count implied by the output channels
+    and model names, the mask-prototype output of segmentation models, and dynamic spatial shapes. Nothing is
+    written to disk and the passed model is never modified. Findings are split into warnings and errors and
+    returned as a stable :class:`ExportPrecheckReport`.
+
+    Args:
+        model (torch.nn.Module): The YOLO PyTorch model that would be exported (the `Model.model` module).
+        overrides (dict | None): Export configuration overrides, identical to those passed to `Exporter`
+            (format, imgsz, batch, dynamic, nms, quantize, opset, device, ...).
+        verbose (bool): If True, log the report with the package LOGGER.
+
+    Returns:
+        (ExportPrecheckReport): A report with `passed`, `warnings`, `errors`, and the probed input/output shapes.
+    """
+    import importlib.util
+
+    report = ExportPrecheckReport(task=getattr(model, "task", "unknown"))
+    args = get_cfg(DEFAULT_CFG, overrides or {})
+
+    fmt = str(args.format).lower()
+    if fmt in {"tensorrt", "trt"}:  # 'engine' aliases, mirroring Exporter.__call__
+        fmt = "engine"
+    report.format = fmt
+    args.format = fmt
+    fmts_dict = export_formats()
+    fmts = tuple(fmts_dict["Argument"][1:])
+    if fmt not in fmts:
+        import difflib
+
+        match = difflib.get_close_matches(fmt, fmts, n=1, cutoff=0.6)
+        hint = f", did you mean '{match[0]}'?" if match else ""
+        report.error("INVALID_FORMAT", f"Invalid export format='{fmt}'{hint} Valid formats are {fmts}.")
+        if verbose:
+            LOGGER.info(f"\n{report}")
+        return report
+    fmt_keys = dict(zip(fmts_dict["Argument"], fmts_dict["Arguments"]))[fmt]
+
+    # Argument/precision compatibility, mirroring validate_args (which Exporter itself asserts on).
+    try:
+        validate_args(fmt, args, fmt_keys)
+    except AssertionError as e:
+        message = str(e)
+        if message.startswith("ERROR ❌️ "):  # validate_args prefixes hard failures
+            message = message[len("ERROR ❌️ ") :]
+        report.error("UNSUPPORTED_ARGUMENT", message.strip())
+
+    # TensorRT requires a CUDA device; the signature probe still runs on CPU so remaining checks can complete.
+    device_arg = args.device
+    if fmt == "engine":
+        device_arg = "0" if device_arg is None or "dla" in str(device_arg) else device_arg
+        if not torch.cuda.is_available():
+            report.error(
+                "DEVICE_UNAVAILABLE",
+                "TensorRT (format='engine') export requires a CUDA GPU, but no CUDA device is available; "
+                "export to 'onnx' on CPU instead or run on a CUDA machine.",
+            )
+            device_arg = "cpu"
+    try:
+        device = select_device("cpu" if device_arg is None else device_arg)
+    except Exception as e:
+        report.error("DEVICE_UNAVAILABLE", f"Requested device '{device_arg}' is unavailable: {e}")
+        device = select_device("cpu")
+    report.device = str(device)
+
+    if fmt == "engine" and importlib.util.find_spec("tensorrt") is None:
+        report.warning(
+            "TRT_PACKAGE_MISSING",
+            "TensorRT is not installed; export will attempt to pip install 'tensorrt' before building the engine.",
+        )
+
+    # Prepare an isolated, export-ready copy exactly like Exporter.__call__ does; the caller's model is untouched.
+    imgsz = args.imgsz
+    try:
+        prepped = deepcopy(model).to(device)
+        head = getattr(prepped, "model", [prepped])[-1]
+        if not getattr(prepped, "names", None):
+            nc = head.linear.out_features if isinstance(head, Classify) else getattr(head, "nc", 999)
+            prepped.names = default_class_names(nc=nc)
+        prepped.names = check_class_names(prepped.names)
+        nc = len(prepped.names)
+        family, extra, nm = _output_signature_expected(head, nc)
+
+        if hasattr(prepped, "end2end"):
+            prepped.end2end = args.nms is False
+        imgsz = check_imgsz(args.imgsz, stride=prepped.stride, min_dim=2)
+
+        # Normalize the NMS option exactly as Exporter does, recording its warnings/errors as diagnostics.
+        if args.nms and "nms" not in fmt_keys:
+            report.warning(
+                "NMS_UNSUPPORTED_FORMAT",
+                f"format='{fmt}' does not support embedded NMS; the raw output will be exported for external NMS.",
+            )
+            args.nms = None
+        if args.nms and prepped.task in {"semantic", "depth"}:
+            report.warning(
+                "NMS_UNSUPPORTED_TASK",
+                f"'nms=True' is not valid for {prepped.task} models; exporting native outputs.",
+            )
+            args.nms = None
+        if args.nms and isinstance(prepped, ClassificationModel):
+            report.error("NMS_CLASSIFICATION_UNSUPPORTED", "'nms=True' is not valid for classification models.")
+            args.nms = None
+        if fmt == "engine" and getattr(prepped, "end2end", False):
+            trt_version = _package_version("tensorrt")
+            if trt_version and check_version(trt_version, "<8.5.0", hard=False):
+                prepped.end2end = False
+                report.warning(
+                    "TRT_END2END_DISABLED",
+                    f"TensorRT {trt_version} (<8.5.0) does not support the Mod operator in end-to-end models; "
+                    "the one-to-many output will be exported instead. Upgrade TensorRT to >=8.5.0 to keep NMS-free.",
+                )
+            if (
+                args.quantize == 8
+                and trt_version
+                and check_version(trt_version, ">=10.3.0,<10.4.0")
+                and is_jetson(jetpack=6)
+            ):
+                report.error(
+                    "JETPACK_INT8_NMS_UNSUPPORTED",
+                    "TensorRT 10.3.0 on JetPack 6 cannot build INT8 NMS ('nms=True') exports.",
+                )
+        if args.nms and (getattr(prepped, "end2end", False) or not isinstance(head, Detect)):
+            report.warning(
+                "NMS_UNSUPPORTED_HEAD",
+                "'nms=True' is not available for end-to-end models or non-YOLO detection heads; "
+                "exporting native outputs.",
+            )
+            args.nms = None
+        if args.nms:
+            args.conf = 0.25 if args.conf is None else args.conf
+
+        # ONNX operator requirements: embedded NMS needs torch>=1.13 and opset>=11.
+        if fmt == "onnx":
+            min_opset = {"classify": 7, "depth": 11}.get(prepped.task, 11 if args.nms else 9)
+            if type(head).__name__ == "RTDETRDecoder":
+                min_opset = 16
+            if args.nms and not TORCH_1_13:
+                report.error(
+                    "ONNX_NMS_TORCH_VERSION",
+                    f"ONNX export with 'nms=True' requires torch>=1.13, but torch=={TORCH_VERSION} is installed.",
+                )
+            if args.opset and args.opset < min_opset:
+                report.error(
+                    "ONNX_OPSET_UNSUPPORTED",
+                    f"ONNX export of this model requires opset>={min_opset}, but opset={args.opset} was requested.",
+                )
+
+        if (fmt in {"engine", "coreml"} or args.nms) and args.dynamic and args.batch == 1:
+            report.warning(
+                "DYNAMIC_BATCH_UNBOUNDED",
+                "'dynamic=True' export requires a maximum batch size, e.g. 'batch=16'; only spatial axes vary.",
+            )
+
+        for p in prepped.parameters():
+            p.requires_grad = False
+        prepped.eval()
+        prepped.float()
+        prepped = prepped.fuse(imgsz=imgsz)
+        head = getattr(prepped, "model", [prepped])[-1]  # fuse keeps the layer list; refresh for safety
+        for m in prepped.modules():
+            if isinstance(m, (Classify, SemanticSegment, Depth)):
+                m.export = True
+                m.format = fmt
+            if isinstance(m, (Detect, RTDETRDecoder)):  # includes Segment, Pose, OBB
+                m.dynamic = args.dynamic
+                m.export = True
+                m.format = fmt
+                available = (
+                    m.num_queries
+                    if isinstance(m, RTDETRDecoder)
+                    else sum(int(imgsz[0] / s) * int(imgsz[1] / s) for s in prepped.stride.tolist())
+                )
+                m.max_det = min(args.max_det, available)
+                m.agnostic_nms = args.agnostic_nms
+                m.xyxy = args.nms and fmt != "coreml"
+                m.shape = None  # force anchor rebuild at the probe input size
+                if hasattr(prepped, "pe") and hasattr(m, "fuse") and not hasattr(m, "lrpc"):  # YOLOE models
+                    m.fuse(prepped.pe.to(device))
+            elif isinstance(m, C2f) and fmt not in {"saved_model", "pb", "edgetpu"}:
+                m.forward = m.forward_split
+
+        im = torch.zeros(args.batch, prepped.yaml.get("channels", 3), *imgsz).to(device)
+        wrapped = NMSModel(prepped, args) if args.nms and fmt not in {"coreml", "imx"} else prepped
+        y = wrapped(im)  # dry run, identical to the Exporter pre-export pass
+    except Exception as e:
+        report.error(
+            "MODEL_FORWARD_FAILED",
+            f"the export-prepared model failed on input {tuple(im.shape) if 'im' in locals() else imgsz}: {e}",
+        )
+        if verbose:
+            LOGGER.info(f"\n{report}")
+        return report
+
+    report.input_shape = tuple(im.shape)
+    report.output_shape = (
+        tuple(y.shape)
+        if isinstance(y, torch.Tensor)
+        else tuple(tuple(x.shape if isinstance(x, torch.Tensor) else []) for x in y)
+    )
+
+    end2end = getattr(prepped, "end2end", False) and not args.nms
+    _check_output_signature(report, wrapped, y, im, head, nc, family, extra, nm, args, end2end)
+    if args.dynamic:
+        # Embedded NMS zero-pads a fixed max_det count; an end-to-end top-k can shrink on tiny inputs.
+        _check_dynamic_shape(report, wrapped, y, im, prepped, family, args, bool(args.nms), end2end)
+
+    if verbose:
+        LOGGER.info(f"\n{report}")
+    return report
+
+
+def _check_output_signature(report, wrapped, y, im, head, nc, family, extra, nm, args, end2end) -> None:
+    """Verify the dry-pass output against the signature that Results/NMS postprocessing consumes.
+
+    Args:
+        report (ExportPrecheckReport): Report to append findings to.
+        wrapped (torch.nn.Module): The export-prepared model or NMSModel wrapper that produced `y`.
+        y (torch.Tensor | tuple): Dry-pass model output.
+        im (torch.Tensor): Dry-pass input tensor (B, C, H, W).
+        head (torch.nn.Module): Output head of the prepared model.
+        nc (int): Number of model class names.
+        family (str): Output family from `_output_signature_expected`.
+        extra (int): Expected extra channels (mask coefficients, keypoints, or angle).
+        nm (int): Expected number of mask prototypes.
+        args (SimpleNamespace): Resolved export arguments.
+        end2end (bool): Whether the head emits NMS-free end-to-end detections.
+    """
+    b, _, h, w = im.shape
+    embedded_nms = isinstance(wrapped, NMSModel)
+    if family not in {"detect", "segment", "pose", "obb"}:  # classify/semantic/depth have no BCN box signature
+        return
+
+    def fail(code, message):
+        report.error(code, message)
+
+    if embedded_nms or end2end:
+        # NMS-free/embedded-NMS heads emit (B, max_det, 6 + extra), plus prototypes for segmentation.
+        if family == "segment":
+            if not isinstance(y, (tuple, list)) or len(y) != 2 or not all(isinstance(x, torch.Tensor) for x in y):
+                fail(
+                    "OUTPUT_SIGNATURE_INVALID",
+                    f"segment NMS output must be a (detections, prototypes) tuple, got {type(y)}.",
+                )
+                return
+            det, proto = y
+        else:
+            if not isinstance(y, torch.Tensor):
+                fail("OUTPUT_SIGNATURE_INVALID", f"expected a single detections tensor, got output of type {type(y)}.")
+                return
+            det, proto = y, None
+        if det.ndim != 3 or det.shape[0] != b:
+            fail(
+                "OUTPUT_SIGNATURE_INVALID",
+                f"detections must have shape (batch, max_det, channels) with batch={b}, got {tuple(det.shape)}.",
+            )
+        else:
+            want_cols = 6 + extra
+            if det.shape[-1] != want_cols:
+                fail(
+                    "OUTPUT_SIGNATURE_INVALID",
+                    f"detections have {det.shape[-1]} columns but Results postprocessing expects {want_cols} "
+                    f"(4 boxes, 1 score, 1 class, {extra} task channels).",
+                )
+            # NMSModel zero-pads to args.max_det; the NMS-free head top-k is clamped to available anchors.
+            want_count = int(args.max_det) if embedded_nms else int(getattr(head, "max_det", args.max_det))
+            if det.shape[1] != want_count:
+                fail(
+                    "OUTPUT_SIGNATURE_INVALID",
+                    f"detections keep {det.shape[1]} rows, expected {want_count} "
+                    f"({'max_det' if embedded_nms else 'top-k limited by available anchors'}).",
+                )
+        if proto is not None:
+            _check_proto(report, proto, b, nm, h, w)
+        return
+
+    # Raw outputs for external NMS: (B, 4 + nc + extra, anchors), plus a prototype tensor for segmentation.
+    if family == "segment":
+        if not isinstance(y, (tuple, list)) or len(y) != 2 or not all(isinstance(x, torch.Tensor) for x in y):
+            fail("OUTPUT_SIGNATURE_INVALID", f"segment output must be a (detections, prototypes) tuple, got {type(y)}.")
+            return
+        det, proto = y
+    else:
+        if not isinstance(y, torch.Tensor):
+            fail("OUTPUT_SIGNATURE_INVALID", f"expected a single raw output tensor, got output of type {type(y)}.")
+            return
+        det, proto = y, None
+    if det.ndim != 3 or det.shape[0] != b:
+        fail(
+            "OUTPUT_SIGNATURE_INVALID",
+            f"raw output must have shape (batch, {4 + nc + extra}, anchors) with batch={b}, got {tuple(det.shape) if isinstance(det, torch.Tensor) else type(det)}.",
+        )
+    else:
+        want_channels = 4 + nc + extra
+        if det.shape[1] != want_channels:
+            found_nc = det.shape[1] - 4 - extra
+            fail(
+                "CLASS_COUNT_MISMATCH",
+                f"raw output has {det.shape[1]} channels ({found_nc} classes) but the model defines {nc} class names; "
+                f"Results decodes {want_channels} channels (4 boxes + {nc} classes + {extra} task channels). "
+                "The exported model and its class names are inconsistent.",
+            )
+        elif isinstance(head, Detect) and not isinstance(head, RTDETRDecoder):
+            anchors = sum(int(h / s) * int(w / s) for s in head.stride.tolist())
+            if det.shape[2] != anchors:
+                fail(
+                    "OUTPUT_SIGNATURE_INVALID",
+                    f"raw output provides {det.shape[2]} anchors for input {(h, w)}, expected {anchors} from strides "
+                    f"{[int(s) for s in head.stride.tolist()]}.",
+                )
+    if proto is not None:
+        _check_proto(report, proto, b, nm, h, w)
+
+
+def _check_proto(report, proto, b, nm, h, w) -> None:
+    """Validate the segmentation prototype tensor that Results' mask processing multiplies mask coefficients by."""
+    if proto.ndim != 4 or proto.shape[0] != b:
+        report.error(
+            "MASK_PROTO_MISMATCH",
+            f"mask prototypes must have shape (batch, {nm}, H/4, W/4) with batch={b}, got {tuple(proto.shape)}.",
+        )
+        return
+    if proto.shape[1] != nm:
+        report.error(
+            "MASK_PROTO_MISMATCH",
+            f"mask prototypes provide {proto.shape[1]} channels but detections carry {nm} mask coefficients; "
+            "Results.process_mask requires them to match.",
+        )
+    if tuple(proto.shape[2:]) != (h // 4, w // 4):
+        report.error(
+            "MASK_PROTO_MISMATCH",
+            f"mask prototypes have spatial shape {tuple(proto.shape[2:])} for input {(h, w)}, expected "
+            f"{(h // 4, w // 4)} (input / 4).",
+        )
+
+
+def _check_dynamic_shape(report, wrapped, y0, im, prepped, family, args, embedded_nms, end2end) -> None:
+    """Re-run the prepared model at a taller input and verify dynamic axes behave as the ONNX/TRT export declares."""
+    b, c, h, w = im.shape
+    stride = int(prepped.stride.max())
+    im2 = torch.zeros(b, c, h + stride, w, device=im.device)
+    try:
+        y1 = wrapped(im2)
+    except Exception as e:
+        report.error(
+            "DYNAMIC_SHAPE_FAILED",
+            f"the export-prepared model fails at a dynamic input shape {tuple(im2.shape)} (base shape {tuple(im.shape)}): {e}",
+        )
+        return
+
+    def pair(y):
+        if isinstance(y, (tuple, list)):
+            return y[0], y[1] if family == "segment" and len(y) > 1 else None
+        return y, None
+
+    d0, p0 = pair(y0)
+    d1, p1 = pair(y1)
+    if embedded_nms:
+        # Embedded NMS zero-pads a fixed (batch, args.max_det) count regardless of input resolution.
+        if not isinstance(d1, torch.Tensor) or d1.ndim != 3 or d1.shape[:2] != d0.shape[:2]:
+            report.error(
+                "DYNAMIC_SHAPE_FAILED",
+                f"embedded-NMS detections change shape under dynamic input: {tuple(d0.shape)} -> "
+                f"{tuple(d1.shape) if isinstance(d1, torch.Tensor) else type(d1)}; expected a fixed "
+                "(batch, max_det) count.",
+            )
+    elif end2end:
+        # NMS-free heads keep batch and the [box, score, class, extra] columns; top-k rows may shrink on tiny inputs.
+        if (
+            not isinstance(d1, torch.Tensor)
+            or d1.ndim != 3
+            or d1.shape[0] != d0.shape[0]
+            or d1.shape[-1] != d0.shape[-1]
+        ):
+            report.error(
+                "DYNAMIC_SHAPE_FAILED",
+                f"end-to-end detections must keep batch and column dims under dynamic input, got {tuple(d0.shape)} -> "
+                f"{tuple(d1.shape) if isinstance(d1, torch.Tensor) else type(d1)}.",
+            )
+    elif not isinstance(d1, torch.Tensor) or d1.ndim != 3 or d1.shape[:2] != d0.shape[:2] or d1.shape[2] == d0.shape[2]:
+        report.error(
+            "DYNAMIC_SHAPE_FAILED",
+            f"raw detections must keep batch/channel dims and vary the anchor count with the input size, "
+            f"got {tuple(d0.shape)} -> {tuple(d1.shape) if isinstance(d1, torch.Tensor) else type(d1)}.",
+        )
+    if family == "segment":
+        if (
+            not isinstance(p1, torch.Tensor)
+            or p1.shape[:2] != p0.shape[:2]
+            or tuple(p1.shape[2:]) <= tuple(p0.shape[2:])
+        ):
+            report.error(
+                "DYNAMIC_SHAPE_FAILED",
+                f"mask prototypes must scale with the dynamic input size, got {tuple(p0.shape)} -> "
+                f"{tuple(p1.shape) if isinstance(p1, torch.Tensor) else type(p1)}.",
+            )
+
+
 def try_export(inner_func):
     """YOLO export decorator, i.e. @try_export."""
     inner_args = get_default_args(inner_func)

@@ -786,16 +786,15 @@ class Model(torch.nn.Module):
             'path/to/exported/model.onnx'
         """
         self._check_is_pytorch_model()
-        from .exporter import Exporter, export_formats
+        from .exporter import Exporter, export_formats, precheck_export
 
-        custom = {
-            "imgsz": self.model.args["imgsz"],
-            "batch": 1,
-            "data": None,
-            "device": None,  # reset to avoid multi-GPU errors
-            "verbose": False,
-        }  # method defaults
-        args = {**self.overrides, **custom, **kwargs, "mode": "export"}  # highest priority args on the right
+        args = self._export_args(kwargs)
+        report = precheck_export(self.model, args, verbose=False)  # fail before writing any export artifact
+        if not report.passed:
+            raise RuntimeError(
+                f"Export precheck failed for format='{report.format}'; resolve the errors below or call "
+                f"model.export_precheck(...) for the full report:\n{report}"
+            )
         try:
             return Exporter(overrides=args, _callbacks=self.callbacks)(model=self.model)
         except Exception:
@@ -806,6 +805,45 @@ class Model(torch.nn.Module):
             )
             LOGGER.info(f"Export to {format_name} in the cloud with Ultralytics Platform: {PLATFORM_URL}")
             raise
+
+    def _export_args(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Assemble the resolved export argument dict shared by export() and export_precheck()."""
+        custom = {
+            "imgsz": self.model.args["imgsz"],
+            "batch": 1,
+            "data": None,
+            "device": None,  # reset to avoid multi-GPU errors
+            "verbose": False,
+        }  # method defaults
+        return {**self.overrides, **custom, **kwargs, "mode": "export"}  # highest priority args on the right
+
+    def export_precheck(self, verbose: bool = True, **kwargs: Any):
+        """Precheck device, operator, and output-signature compatibility without exporting.
+
+        Runs the same pre-export checks :meth:`export` performs before writing any artifact: the target device
+        (e.g. CUDA for TensorRT), format/operator requirements (e.g. ONNX opset and torch version for embedded
+        NMS), the dynamic-shape declaration, the class count against the model names, and the output signature
+        consumed by Results postprocessing (including the mask-prototype output of segmentation models). The check
+        runs on an in-memory copy of the model: no files are written and the model is not modified.
+
+        Args:
+            verbose (bool): If True, log the report.
+            **kwargs (Any): Export configuration, identical to :meth:`export` keyword arguments (format, imgsz,
+                batch, dynamic, nms, quantize, opset, device, ...).
+
+        Returns:
+            (ultralytics.engine.exporter.ExportPrecheckReport): A stable report with `passed`, `warnings`,
+                `errors`, `input_shape`, and `output_shape`. Warnings do not block export; errors indicate an
+                export that is expected to fail or produce an unusable artifact.
+
+        Examples:
+            >>> model = YOLO("yolo26n-seg.pt")
+            >>> report = model.export_precheck(format="onnx", dynamic=True)  # warnings/errors, no files written
+        """
+        self._check_is_pytorch_model()
+        from .exporter import precheck_export
+
+        return precheck_export(self.model, self._export_args(kwargs), verbose=verbose)
 
     def train(
         self,
