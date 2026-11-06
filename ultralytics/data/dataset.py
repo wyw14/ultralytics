@@ -40,9 +40,12 @@ from .utils import (
     HELP_URL,
     IMG_FORMATS,
     check_file_speeds,
+    find_img_files,
+    get_file_fingerprint,
     get_hash,
     get_split_fraction,
     img2label_paths,
+    inspect_dataset_cache,
     load_dataset_cache_file,
     load_depth,
     polygons2masks_overlap,
@@ -160,7 +163,13 @@ class YOLODataset(BaseDataset):
             if self.augment:  # training requires labels; unlabeled val splits (e.g. COCO test-dev) only warn
                 raise ValueError(f"{self.prefix}No labels found in {path}. {HELP_URL}")
             LOGGER.warning(f"{self.prefix}No labels found in {path}. {HELP_URL}")
-        x["hash"] = self.get_cache_hash()
+        key_files, scan_tokens, scan_args = self.get_cache_key_parts()
+        x["hash"] = get_hash(key_files + scan_tokens)
+        x["scan_args"] = scan_args  # separable scan settings for read-only cache invalidation diagnostics
+        x["fingerprints"] = {  # cache-time (size, mtime_ns) fingerprints; os.stat metadata only
+            "images": {f: get_file_fingerprint(f) for f in self.im_files},
+            "labels": {f: get_file_fingerprint(f) for f in self.label_files},
+        }
         x["results"] = nf, nm, ne, nc, total
         x["msgs"] = msgs  # warnings
         if x["labels"]:
@@ -176,16 +185,29 @@ class YOLODataset(BaseDataset):
         self.label_files = img2label_paths(self.im_files)
         return self.label_files
 
+    def get_cache_key_parts(self) -> tuple[list[str], list[str], tuple]:
+        """Return the hashed file paths, hash tokens, and structured scan settings used to validate a label cache.
+
+        The scan settings cover keypoint usage, the label class count, the keypoint shape, and single-class mode.
+        Subclasses override this hook to hash their own companion files and settings; the hash tokens reproduce the
+        exact entries appended to `get_hash`, keeping existing caches valid.
+
+        Returns:
+            (tuple): (hashed file paths, scan-setting token strings appended to the hash, structured scan settings).
+        """
+        # add_polygon_background() class is not a label class, so segment and semantic share one cache
+        nc = self.data.get("bg_class_idx") or len(self.data["names"])
+        scan_args = (self.use_keypoints, nc, self.data.get("kpt_shape"), self.single_cls)
+        return self.label_files + self.im_files, [str(scan_args)], scan_args
+
     def get_cache_hash(self) -> str:
         """Return the hash used to validate a label cache against the current dataset files and scan settings.
 
         Returns:
             (str): Dataset cache hash.
         """
-        # add_polygon_background() class is not a label class, so segment and semantic share one cache
-        nc = self.data.get("bg_class_idx") or len(self.data["names"])
-        scan_args = (self.use_keypoints, nc, self.data.get("kpt_shape"), self.single_cls)
-        return get_hash(self.label_files + self.im_files + [str(scan_args)])
+        key_files, scan_tokens, _ = self.get_cache_key_parts()
+        return get_hash(key_files + scan_tokens)
 
     def scan_summary(self, nf: int, nm: int, ne: int, nc: int) -> str:
         """Return a one-line summary of scan counters for progress bars and cache logs.
@@ -491,15 +513,17 @@ class DepthDataset(YOLODataset):
         """
         self.depth_files_by_image = {f: self._depth_path_for(f) for f in self.im_files}
         self.depth_files = list(self.depth_files_by_image.values())
+        self.label_files = self.depth_files  # shared cache skeleton's companion-file attribute
         return self.depth_files
 
-    def get_cache_hash(self) -> str:
-        """Return a hash over the paired depth and image files.
+    def get_cache_key_parts(self) -> tuple[list[str], list[str], float]:
+        """Return the paired depth and image files, hash tokens, and the depth scale used to validate the cache.
 
         Returns:
-            (str): Dataset cache hash.
+            (tuple): (hashed depth and image file paths, [str(depth scale)], depth scale).
         """
-        return get_hash(self.depth_files + self.im_files + [str(self.data.get("depth_scale", 1000))])
+        depth_scale = self.data.get("depth_scale", 1000)
+        return self.depth_files + self.im_files, [str(depth_scale)], depth_scale
 
     def scan_summary(self, nf: int, nm: int, ne: int, nc: int) -> str:
         """Return a one-line summary of image-depth scan counters."""
@@ -987,16 +1011,18 @@ class SemanticDataset(YOLODataset):
             m if os.path.isfile(m) else next((f for x in sorted(IMG_FORMATS) if os.path.isfile(f := m[:-3] + x)), m)
             for m in masks
         ]
+        self.label_files = self.mask_files  # shared cache skeleton's companion-file attribute
         return self.mask_files
 
-    def get_cache_hash(self) -> str:
-        """Return a hash for semantic cache validation that also includes label_mapping and class count changes.
+    def get_cache_key_parts(self) -> tuple[list[str], list[str], tuple]:
+        """Return image/mask files, hash tokens, and (label_mapping, class count) settings for semantic caches.
 
         Returns:
-            (str): Dataset cache hash.
+            (tuple): (hashed image and mask file paths, label-mapping and class-count hash tokens, settings tuple).
         """
         mapping = json.dumps(self.label_mapping, sort_keys=True, separators=(",", ":"))
-        return get_hash(self.im_files + self.mask_files + [f"label_mapping:{mapping}", f"nc:{len(self.data['names'])}"])
+        settings = (f"label_mapping:{mapping}", f"nc:{len(self.data['names'])}")
+        return self.im_files + self.mask_files, list(settings), settings
 
     def scan_summary(self, nf: int, nm: int, ne: int, nc: int) -> str:
         """Return a one-line summary of image-mask scan counters."""
@@ -1137,6 +1163,7 @@ class PolygonSemanticDataset(SemanticDataset, YOLODataset):
     # Rebind PNG-mask hooks to YOLODataset's polygon .txt implementations; the MRO (SemanticDataset, YOLODataset)
     # would otherwise resolve SemanticDataset's, and its verify_labels syncs mask_files that polygon labels lack.
     get_label_files = YOLODataset.get_label_files
+    get_cache_key_parts = YOLODataset.get_cache_key_parts
     get_cache_hash = YOLODataset.get_cache_hash
     scan_summary = YOLODataset.scan_summary
     verify_args = YOLODataset.verify_args
@@ -1373,3 +1400,53 @@ class ClassificationDataset:
             x["msgs"] = msgs  # warnings
             save_dataset_cache_file(self.prefix, path, x, DATASET_CACHE_VERSION)
             return samples
+
+
+def inspect_label_cache(
+    img_path: str | list[str],
+    data: dict | None = None,
+    task: str = "detect",
+    single_cls: bool = False,
+    fraction: float | int = 1.0,
+    examples: int = 10,
+    mask_paths: bool = False,
+) -> dict:
+    """Report why the label cache for an image source is current or would be invalidated, read-only.
+
+    Mirrors the file discovery and scan settings of `YOLODataset`, but only globs directories and stats files
+    (`os.stat`); it never decodes image pixels, rescans or rewrites labels, or rebuilds/deletes the cache.
+
+    Args:
+        img_path (str | list[str]): Image directory, image/list file, or list of these, as passed to `YOLODataset`.
+        data (dict | None): Dataset config with 'names' (and optional 'kpt_shape'/'bg_class_idx'), matching `YOLODataset`.
+        task (str): Task ('detect', 'segment', 'pose', or 'obb'); 'pose' enables the keypoints scan setting.
+        single_cls (bool): Current single-class training setting.
+        fraction (float | int): Dataset fraction or image count, matching the training run to compare against.
+        examples (int): Maximum example paths included per change category.
+        mask_paths (bool): Replace the common dataset root with '<root>' in returned paths.
+
+    Returns:
+        (dict): Report from `inspect_dataset_cache` with 'status' ('current', 'stale', 'missing', or 'corrupt'),
+            'reasons' ('missing', 'corrupt', 'version_mismatch', 'files_changed', 'settings_changed',
+            'hash_mismatch'), per-group added/removed/modified counts, changed setting names, and 'affected_files'.
+
+    Examples:
+        >>> from ultralytics.data import inspect_label_cache
+        >>> inspect_label_cache("datasets/coco8/images/train", data={"names": {0: "person", 1: "car"}})
+    """
+    data = data or {}
+    im_files = find_img_files(img_path, fraction=get_split_fraction(fraction, "train"))
+    label_files = img2label_paths(im_files)
+    cache_path = Path(label_files[0]).parent.with_suffix(".cache")
+    nc = data.get("bg_class_idx") or len(data.get("names") or {})
+    scan_args = (task == "pose", nc, data.get("kpt_shape"), single_cls)
+    return inspect_dataset_cache(
+        cache_path,
+        im_files,
+        label_files,
+        scan_args=scan_args,
+        expected_version=DATASET_CACHE_VERSION,
+        scan_arg_names=("use_keypoints", "nc", "kpt_shape", "single_cls"),
+        examples=examples,
+        mask_paths=mask_paths,
+    )

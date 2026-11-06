@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import glob
 import os
 import random
 import subprocess
@@ -146,6 +147,48 @@ def img2label_paths(img_paths: list[str | Path], label_dir: str = "labels", suff
     return [sb.join(os.fspath(x).rsplit(sa, 1)).rsplit(".", 1)[0] + f"{suffix}" for x in img_paths]
 
 
+def find_img_files(
+    img_path: str | list[str], fraction: float | int = 1.0, prefix: str = ""
+) -> list[str]:
+    """List dataset image files from a directory, image file, list file, or a list of these.
+
+    Only filesystem metadata and (for list files) their text contents are read; image pixels are never decoded. The
+    `fraction` slice matches `BaseDataset.get_img_files`, which adds image speed checks on top of this listing.
+
+    Args:
+        img_path (str | list[str]): Path or list of paths to image directories, image files, or image-list text files.
+        fraction (float | int): Dataset ratio or image count to keep, applied after sorting.
+        prefix (str): Prefix for error messages.
+
+    Returns:
+        (list[str]): Sorted image paths, truncated to `fraction`.
+
+    Raises:
+        FileNotFoundError: If no images are found or a path does not exist.
+    """
+    try:
+        f = []  # image files
+        for p in img_path if isinstance(img_path, list) else [img_path]:
+            p = Path(p)  # os-agnostic
+            if p.is_dir():  # dir
+                f += glob.glob(str(Path(glob.escape(p)) / "**" / "*.*"), recursive=True)
+            elif p.is_file() and p.suffix[1:].lower() in IMG_FORMATS:  # image file
+                f.append(str(p))
+            elif p.is_file():  # list file
+                with open(p, encoding="utf-8") as t:
+                    t = t.read().strip().splitlines()
+                    parent = str(p.parent) + os.sep
+                    f += [x.replace("./", parent, 1) if x.startswith("./") else x for x in t]  # local to global
+            else:
+                raise FileNotFoundError(f"{prefix}{p} does not exist")
+        im_files = sorted(x.replace("/", os.sep) for x in f if x.rpartition(".")[-1].lower() in IMG_FORMATS)
+        assert im_files, f"{prefix}No images found in {img_path}. {FORMATS_HELP_MSG}"
+    except Exception as e:
+        raise FileNotFoundError(f"{prefix}Error loading data from {img_path}\n{HELP_URL}") from e
+    count = fraction if isinstance(fraction, int) else max(1, round(len(im_files) * fraction))
+    return im_files[:count] if count < len(im_files) else im_files
+
+
 def check_file_speeds(
     files: list[str | Path], threshold_ms: float = 10, threshold_mb: float = 50, max_files: int = 5, prefix: str = ""
 ):
@@ -225,18 +268,32 @@ def check_file_speeds(
         )
 
 
+def get_file_fingerprint(path: str | Path) -> tuple[int, int] | None:
+    """Return a file's (size, modification-time) fingerprint, or None if it does not exist.
+
+    The fingerprint uses `os.stat` metadata only; file contents are never opened or decoded.
+
+    Args:
+        path (str | Path): File path to fingerprint.
+
+    Returns:
+        (tuple[int, int] | None): The (st_size, st_mtime_ns) tuple, or None when the path is missing.
+    """
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return stat.st_size, stat.st_mtime_ns
+
+
 def get_hash(paths: list[str]) -> str:
     """Return a hash of paths and their file sizes and modification times."""
     h = __import__("hashlib").sha256()
     for p in paths:
         h.update(os.fsencode(p))  # fsencode handles surrogate-escaped non-UTF-8 filenames, byte-identical otherwise
         h.update(b"\0")
-        try:
-            stat = os.stat(p)
-        except OSError:
-            h.update(b"\0")
-            continue
-        h.update(f"{stat.st_size}:{stat.st_mtime_ns}".encode())
+        fp = get_file_fingerprint(p)
+        h.update(b"\0" if fp is None else f"{fp[0]}:{fp[1]}".encode())
         h.update(b"\0")
     return h.hexdigest()
 
@@ -1017,6 +1074,199 @@ def save_dataset_cache_file(prefix: str, path: Path, x: dict, version: str):
             LOGGER.warning(f"{prefix}Failed to save cache to {path}: {e}")
     else:
         LOGGER.warning(f"{prefix}Cache directory {path.parent} is not writable, cache not saved.")
+
+
+_MISSING_CACHE_KEY = object()  # sentinel for optional keys absent from older cache files
+
+
+def _diff_cache_files(
+    current: list[str], cached: list[str], cached_fps: dict | None
+) -> tuple[list[str], list[str], list[str], int, int]:
+    """Compare one file group (images or labels) between the current dataset and the cached inventory.
+
+    Args:
+        current (list[str]): Currently discovered file paths.
+        cached (list[str]): File paths recorded in the cache.
+        cached_fps (dict | None): Cache-time {path: (size, mtime_ns)} fingerprints, or None for legacy caches that
+            only store the combined hash. When None, same-path content modifications cannot be attributed.
+
+    Returns:
+        (tuple): (added, removed, modified paths, cached count, current count).
+    """
+    cur_set, cac_set = set(map(os.fspath, current)), set(map(os.fspath, cached))
+    added = sorted(cur_set - cac_set)
+    removed = sorted(cac_set - cur_set)
+    modified = []
+    if cached_fps is not None:
+        for p in sorted(cur_set & cac_set):
+            if p in cached_fps and cached_fps[p] != get_file_fingerprint(p):
+                modified.append(p)  # includes labels that were missing at scan time (None) and now exist
+    return added, removed, modified, len(cac_set), len(cur_set)
+
+
+def inspect_dataset_cache(
+    cache_path: str | Path,
+    images: list[str],
+    labels: list[str],
+    scan_args: tuple = (),
+    expected_version: str | None = None,
+    scan_arg_names: tuple[str, ...] = (),
+    scan_tokens: list[str] | None = None,
+    examples: int = 10,
+    mask_paths: bool = False,
+) -> dict:
+    """Check why an existing Ultralytics label cache would be reused or invalidated, without touching dataset files.
+
+    Read-only diagnostic: it stats files (`os.stat`) and loads the cache with NumPy, but never decodes image pixels,
+    rescans labels, rebuilds or deletes the cache, or modifies labels. It compares three things the loader validates:
+
+    - cache version against `expected_version`;
+    - per-file fingerprints (size and modification time) of cached versus current images and labels;
+    - the scan settings (e.g. keypoints, class count, single-class mode) folded into the cache hash.
+
+    Args:
+        cache_path (str | Path): Path of the *.cache file to inspect.
+        images (list[str]): Currently discovered image paths.
+        labels (list[str]): Label paths corresponding to `images` (e.g. from `img2label_paths`).
+        scan_args (tuple): Scan-setting tuple the cache hash is currently computed with.
+        expected_version (str | None): Current cache version; when given, a mismatch is reported.
+        scan_arg_names (tuple[str, ...]): Optional names for the `scan_args` positions, used to name changed settings.
+        scan_tokens (list[str] | None): Exact setting token strings appended after the file paths in the cache hash;
+            defaults to `[str(scan_args)]`.
+        examples (int): Maximum example paths per change category to include in the report.
+        mask_paths (bool): Replace the common dataset root with '<root>' in returned paths.
+
+    Returns:
+        (dict): Report with 'status' ('current', 'stale', 'missing', or 'corrupt'), 'reasons', per-group file counts
+            ('added', 'removed', 'modified'), changed scan settings, 'affected_files', example paths, and
+            'determinate' (False when a legacy cache lacking separable fingerprints leaves file/setting attribution
+            ambiguous).
+    """
+    cache_path = Path(cache_path)
+    reasons: list[str] = []
+    report: dict = {
+        "cache_path": str(cache_path),
+        "exists": cache_path.exists(),
+        "status": "stale",
+        "reasons": reasons,
+        "version": {"cache": None, "expected": expected_version},
+        "files": {
+            g: {"cached": 0, "current": 0, "added": 0, "removed": 0, "modified": 0} for g in ("images", "labels")
+        },
+        "settings": {
+            "changed": [],
+            "cached": None,
+            "current": list(scan_args) if isinstance(scan_args, (list, tuple)) else scan_args,
+        },
+        "affected_files": 0,
+        "determinate": True,
+        "examples": {"added": [], "removed": [], "modified": []},
+    }
+
+    def finish(status: str) -> dict:
+        report["status"] = status
+        counts = report["files"]
+        report["affected_files"] = sum(
+            counts[g][k] for g in ("images", "labels") for k in ("added", "removed", "modified")
+        )
+        for key in report["examples"]:
+            report["examples"][key] = report["examples"][key][:examples]
+        if mask_paths:
+            anchors = [str(Path(cache_path).parent.absolute())] + [
+                str(Path(p).parent.absolute()) for p in images[:32]
+            ]
+            try:
+                root = Path(os.path.commonpath(anchors))
+            except ValueError:
+                root = Path(cache_path).parent
+
+            def mask(p: str) -> str:
+                try:
+                    rel = os.path.relpath(str(Path(p).absolute()), root)
+                    if rel != ".." and not rel.startswith(f"..{os.sep}"):
+                        return os.path.join("<root>", rel)
+                except ValueError:
+                    pass
+                return os.path.join("<root>", Path(p).name)
+
+            report["cache_path"] = mask(str(cache_path))
+            report["examples"] = {k: [mask(p) for p in v] for k, v in report["examples"].items()}
+        return report
+
+    if not cache_path.exists():
+        reasons.append("missing")
+        report["files"]["images"]["current"] = len(images)
+        report["files"]["labels"]["current"] = len(labels)
+        return finish("missing")
+
+    try:
+        cache = load_dataset_cache_file(cache_path)
+        assert isinstance(cache, dict), "cache is not a dictionary"
+        cache_hash = cache["hash"]
+        cache_version = cache["version"]
+        cached_labels = cache["labels"]
+        assert isinstance(cache_hash, str), "missing or invalid 'hash'"
+        assert isinstance(cached_labels, list), "missing or invalid 'labels'"
+        cached_images = [lb["im_file"] for lb in cached_labels]
+        assert all(isinstance(p, str) for p in cached_images), "label entries are missing 'im_file'"
+    except Exception as e:
+        reasons.append("corrupt")
+        report["error"] = str(e)
+        return finish("corrupt")
+
+    report["version"]["cache"] = cache_version
+    if expected_version is not None and cache_version != expected_version:
+        reasons.append("version_mismatch")
+
+    fingerprints = cache.get("fingerprints")
+    fingerprints = fingerprints if isinstance(fingerprints, dict) else None
+    if fingerprints is not None:
+        cached_images = fingerprints.get("images", cached_images)
+        cached_labels = fingerprints.get("labels", cached_labels)
+    else:
+        cached_labels = img2label_paths(cached_images)
+    diffs = {}
+    for group, current, cached, fps in (
+        ("images", images, cached_images, None if fingerprints is None else fingerprints.get("images")),
+        ("labels", labels, cached_labels, None if fingerprints is None else fingerprints.get("labels")),
+    ):
+        added, removed, modified, n_cached, n_current = _diff_cache_files(current, cached, fps)
+        diffs[group] = (added, removed, modified)
+        stats = report["files"][group]
+        stats.update(cached=n_cached, current=n_current, added=len(added), removed=len(removed), modified=len(modified))
+        report["examples"]["added"] += added
+        report["examples"]["removed"] += removed
+        report["examples"]["modified"] += modified
+    if any(any(diffs[g]) for g in diffs):
+        reasons.append("files_changed")
+
+    old_scan = cache.get("scan_args", _MISSING_CACHE_KEY)
+    report["settings"]["cached"] = None if old_scan is _MISSING_CACHE_KEY else old_scan
+    if old_scan is not _MISSING_CACHE_KEY and old_scan != scan_args:
+        reasons.append("settings_changed")
+        if isinstance(old_scan, (list, tuple)) and isinstance(scan_args, (list, tuple)):
+            names = scan_arg_names or tuple(f"arg{i}" for i in range(max(len(old_scan), len(scan_args))))
+            report["settings"]["changed"] = [
+                names[i] for i in range(min(len(names), len(old_scan), len(scan_args))) if old_scan[i] != scan_args[i]
+            ]
+
+    # The hash folds in fingerprints and settings; probe it to attribute legacy caches or catch any residual drift.
+    tokens = scan_tokens if scan_tokens is not None else [str(scan_args)]
+    current_hash_a = get_hash([*labels, *images, *tokens])
+    current_hash_b = get_hash([*images, *labels, *tokens])
+    if cache_hash not in {current_hash_a, current_hash_b}:
+        if old_scan is _MISSING_CACHE_KEY:
+            probe = get_hash([*cached_labels, *cached_images, *tokens])
+            if probe != cache_hash and not any(any(diffs[g][:2]) for g in diffs):
+                reasons.append("hash_mismatch")  # same paths, but fingerprints and/or settings cannot be separated
+                report["determinate"] = False
+            elif probe != cache_hash:
+                report["determinate"] = False  # files certainly changed; settings contribution is unknown
+        elif "files_changed" not in reasons and "settings_changed" not in reasons:
+            reasons.append("hash_mismatch")
+            report["determinate"] = False
+
+    return finish("current" if not reasons else "stale")
 
 
 def add_polygon_background(data: dict) -> dict:

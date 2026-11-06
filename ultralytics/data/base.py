@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import glob
 import math
 import os
 import random
@@ -17,7 +16,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from ultralytics.data.utils import FORMATS_HELP_MSG, HELP_URL, IMG_FORMATS, check_file_speeds, get_split_fraction
+from ultralytics.data.utils import check_file_speeds, find_img_files, get_split_fraction
 from ultralytics.utils import DEFAULT_CFG, LOCAL_RANK, LOGGER, NUM_THREADS, TQDM, IterableSimpleNamespace
 from ultralytics.utils.patches import imread
 
@@ -200,28 +199,7 @@ class BaseDataset(Dataset):
         Raises:
             FileNotFoundError: If no images are found or the path doesn't exist.
         """
-        try:
-            f = []  # image files
-            for p in img_path if isinstance(img_path, list) else [img_path]:
-                p = Path(p)  # os-agnostic
-                if p.is_dir():  # dir
-                    f += glob.glob(str(Path(glob.escape(p)) / "**" / "*.*"), recursive=True)
-                elif p.is_file() and p.suffix[1:].lower() in IMG_FORMATS:  # image file
-                    f.append(str(p))
-                elif p.is_file():  # text file
-                    with open(p, encoding="utf-8") as t:
-                        t = t.read().strip().splitlines()
-                        parent = str(p.parent) + os.sep
-                        f += [x.replace("./", parent, 1) if x.startswith("./") else x for x in t]  # local to global
-                else:
-                    raise FileNotFoundError(f"{self.prefix}{p} does not exist")
-            im_files = sorted(x.replace("/", os.sep) for x in f if x.rpartition(".")[-1].lower() in IMG_FORMATS)
-            # self.img_files = sorted([x for x in f if x.suffix[1:].lower() in IMG_FORMATS])  # pathlib
-            assert im_files, f"{self.prefix}No images found in {img_path}. {FORMATS_HELP_MSG}"
-        except Exception as e:
-            raise FileNotFoundError(f"{self.prefix}Error loading data from {img_path}\n{HELP_URL}") from e
-        count = self.fraction if isinstance(self.fraction, int) else max(1, round(len(im_files) * self.fraction))
-        im_files = im_files[:count] if count < len(im_files) else im_files
+        im_files = find_img_files(img_path, fraction=self.fraction, prefix=self.prefix)
         check_file_speeds(im_files, prefix=self.prefix)  # check image read speeds
         return im_files
 

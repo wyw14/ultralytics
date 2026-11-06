@@ -10,6 +10,7 @@ from .dataset import (
     YOLOConcatDataset,
     YOLODataset,
     YOLOMultiModalDataset,
+    inspect_label_cache,
 )
 
 __all__ = (
@@ -21,6 +22,7 @@ __all__ = (
     "YOLOConcatDataset",
     "YOLODataset",
     "YOLOMultiModalDataset",
+    "inspect_label_cache",
     "build_dataloader",
     "build_grounding",
     "build_yolo_dataset",
